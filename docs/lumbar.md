@@ -30,6 +30,8 @@ Det finnes én lokal testundersøkelse. Inferens må produsere 25 unike, endelig
 
 Ved evaluering med en historisk referansemodell, bruk `--baseline-oof` i `medimage.spine_evaluate`. Hvis den valgte konfigurasjonen bruker globale sannsynligheter, oppgi dens validerte CSV med `--baseline-submission`.
 
+`medimage.spine_reference` gjenskaper referansens inferens fra rå DICOM for fem lokale checkpoint. Referansen bruker 224 piksler, fem lineært fordelte snitt per serie, en delt ResNet-18 og gjennomsnittspooling. De historiske checkpointene ble trent fra ImageNet-initialisering over de samme foldene med AdamW og FP16.
+
 ## Begrensninger og utdanningsverdi
 
 Sekvensvalg ved flere serier favoriserer dekningsområde for aksial T2 og antall snitt for de sagittale seriene. Den statistiske atlasmodellen kan feile ved uvanlig anatomi, stort avvik i orientering eller delvis bildefelt. Institusjonsuavhengig og klinisk ytelse må etableres i separate studier. Prosjektet viser hvordan fysisk bildegeometri, nestet kryssvalidering og en målspesifikk metrikk virker sammen.
