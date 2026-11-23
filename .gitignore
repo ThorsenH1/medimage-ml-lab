@@ -1,0 +1,13 @@
+/artifacts/
+__pycache__/
+.pytest_cache/
+.venv/
+*.egg-info/
+*.pt
+*.pth
+*.npy
+*.npz
+*.dcm
+*.csv
+*.log
+*.partial
