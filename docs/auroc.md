@@ -26,6 +26,10 @@ The 1024-pixel training cache contains 2,105 aligned training lesions. Masks for
 
 The Mammo-CLIP variant imports only image-encoder tensors from the publicly released contrastive EfficientNet-B5 checkpoint. The authors document UPMC mammography pretraining. The state loader verifies the source checksum and checks every converted encoder tensor during loading. [Mammo-CLIP paper](https://papers.miccai.org/miccai-2024/paper/0926_paper.pdf) · [Checkpoint](https://huggingface.co/shawn24/Mammo-CLIP/blob/main/Pre-trained-checkpoints/b5-model-best-epoch-7.tar)
 
+The follow-up experiments include a 1,536-pixel spatial model, a higher-resolution Mammo-CLIP refinement and a multi-task classifier with mass and calcification specialists. The latter learns its routing from known training lesion types. At inference the classifier estimates routing from the images and needs only the available whole views. The EfficientNet-B3 experiment uses a pinned ImageNet initialization and an independently seeded dual-view fine-tune, motivated by published breast-level comparisons. [Direct and two-view classifier study](https://doi.org/10.1002/ima.70436) · [Pinned ImageNet checkpoint](https://huggingface.co/timm/efficientnet_b3.ra2_in1k/blob/707c9b711f7f114b4c1601d566a4aaf9fdba4a49/model.safetensors)
+
+The breast proposal ensemble splits development patients into three disjoint folds and fits each patch detector on two folds. Each development breast contributes proposals from a detector that never saw that patient. The attention head learns breast-level malignancy from these proposals. Validation and test predictions average across detectors using only whole images. A grouped validation comparison also supports regularized nonnegative blends that optimize smooth positive–negative ranking loss.
+
 ## Reports and prediction
 
 The local evaluation report includes ROC, precision–recall, subgroup summaries, paired patient-bootstrap intervals and examples with held-out reference labels. Public portfolio reports use aggregate benchmarks and synthetic input examples.

@@ -41,7 +41,8 @@ def new_model(config: dict, weights: Path, *, initialize: bool = False):
             return ChestReference(config['depth'])
         return ChestDense(config['backbone'], config['depth'], weights if initialize else None)
     return MammographySpatial(config['backbone'], config['resolution'], weights,
-                              config['depth'], config['dropout'], config.get('pyramid', False), initialize)
+                              config['depth'], config['dropout'], config.get('pyramid', False),
+                              initialize, config.get('specialize', False))
 
 
 class ResidentPixels:
@@ -125,7 +126,7 @@ def fit(args) -> None:
         'lr', 'head_lr', 'class_power', 'auxiliary', 'dropout', 'tta', 'focal_neg')}
     config.update(manifest=audit['manifest_sha256'], pixel_sha256=pixel_hash,
                   parent_sha256=checksum(args.parent) if args.parent else None)
-    for option in ('pyramid', 'affine', 'block'):
+    for option in ('pyramid', 'affine', 'block', 'specialize'):
         if getattr(args, option):
             config[option] = getattr(args, option)
     model = new_model(config, args.weights, initialize=args.parent is None).cuda()
@@ -142,7 +143,14 @@ def fit(args) -> None:
             'task', 'backbone', 'manifest', 'weight_sha256')
         if any(config[key] != starter['config'].get(key) for key in fixed):
             raise ValueError('Warm start differs from the expected architecture, cohort or foundation')
-        model.load_state_dict(starter['model'])
+        introducing_experts = args.specialize and not starter['config'].get('specialize')
+        if introducing_experts:
+            transfer_state = model.load_state_dict(starter['model'], strict=False)
+            expert_parameters = {'router.weight', 'router.bias', 'offset.weight', 'offset.bias'}
+            if set(transfer_state.missing_keys) != expert_parameters or transfer_state.unexpected_keys:
+                raise ValueError('Warm-start weights differ beyond the new specialist heads')
+        else:
+            model.load_state_dict(starter['model'])
     params = [p for name, p in model.named_parameters() if name.startswith('encoder.') and p.requires_grad]
     head = [p for name, p in model.named_parameters() if not name.startswith('encoder.') and p.requires_grad]
     optimizer = torch.optim.AdamW([{'params': params, 'lr': args.lr},
@@ -152,6 +160,13 @@ def fit(args) -> None:
     correction = np.log(target_weights) if not args.focal_neg else np.zeros_like(target_weights)
     y = torch.from_numpy(labels).cuda()
     positive_weights = torch.from_numpy(target_weights).cuda()
+    if args.specialize:
+        annotations = frame.iloc[training]['type'].map({'mass': 0, 'calc': 1})
+        if annotations.isna().any():
+            raise ValueError('Specialist training expects mass or calcification labels in the training set')
+        training_type = np.full(len(frame), -1, dtype=np.int64)
+        training_type[training] = annotations.to_numpy()
+        training_type = torch.from_numpy(training_type).cuda()
     args.output.mkdir(parents=True, exist_ok=True)
     last = args.output / 'last.pt'
     history, best = [], -float('inf')
@@ -188,9 +203,15 @@ def fit(args) -> None:
                     heatmaps = transfer(arrays['heatmaps'], rows)
                     if args.affine:
                         pixels, heatmaps = align_augmentation(pixels, heatmaps)
-                    score, spatial = model(pixels, transfer(arrays['views'], rows))
+                    score, spatial, *specialist = model(pixels, transfer(arrays['views'], rows))
                     lesion_loss = spatial_loss(spatial, heatmaps,
                                                transfer(arrays['annotation_available'], rows))
+                    if args.specialize:
+                        routing, experts = specialist
+                        subtype = training_type[rows]
+                        typed = experts.gather(1, subtype[:, None])
+                        lesion_loss = lesion_loss + .7 * F.cross_entropy(routing, subtype)
+                        lesion_loss = lesion_loss + .9 * F.binary_cross_entropy_with_logits(typed, truth)
                 else:
                     score, lesion_loss = model(pixels), 0.
                 error = F.binary_cross_entropy_with_logits(score.float(), truth, pos_weight=positive_weights,
@@ -237,7 +258,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description='Train high-resolution models on the locked radiography cohorts')
     parser.add_argument('task', choices=('chest', 'mammo'))
     parser.add_argument('--backbone', required=True,
-                        choices=('chex', 'imagenet', 'chest-reference', 'effb0', 'r18', 'r50', 'mammo-clip'))
+                        choices=('chex', 'imagenet', 'chest-reference', 'effb0', 'effb3', 'r18', 'r50', 'mammo-clip'))
     for name in ('cohort', 'pixels', 'weights', 'output'):
         parser.add_argument(f'--{name}', type=Path, required=True)
     parser.add_argument('--parent', type=Path)
@@ -258,6 +279,7 @@ def main() -> None:
     parser.add_argument('--resident', action='store_true', help='Store development pixels in memory for faster shuffling')
     parser.add_argument('--affine', action='store_true', help='Apply aligned affine transforms to image and label')
     parser.add_argument('--pyramid', action='store_true', help='Fuse stride-8, -16, and -32 mammography features')
+    parser.add_argument('--specialize', action='store_true', help='Learn mass and calcification specialists and a pixel-based router')
     args = parser.parse_args()
     if min(args.batch, args.epochs, args.accumulate, args.depth) < 1 or args.focal_neg < 0:
         parser.error('Invalid training size or focal exponent')
@@ -267,7 +289,7 @@ def main() -> None:
         parser.error('Provide a trained chest reference checkpoint with --parent')
     if args.resident and args.block:
         parser.error('Use either resident development pixels or block shuffling')
-    if (args.affine or args.pyramid) and args.task != 'mammo':
+    if (args.affine or args.pyramid or args.specialize) and args.task != 'mammo':
         parser.error('Affine targets and feature pyramids require mammography')
     fit(args)
 

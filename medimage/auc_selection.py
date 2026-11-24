@@ -5,6 +5,7 @@ from itertools import combinations
 from pathlib import Path
 
 import numpy as np
+from scipy.optimize import minimize
 from scipy.special import expit
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import GroupKFold
@@ -85,6 +86,50 @@ def label_adaptive_candidate(truth, scores, calibrated, weights, folds, strength
             'metrics': validation_metrics(truth, out)}
 
 
+def fit_pairwise_weights(truth, matrix, strength):
+    positive = truth[:, 0].astype(bool)
+    difference = (matrix[positive, None] - matrix[~positive][None]).reshape(-1, matrix.shape[1])
+    if not len(difference):
+        raise ValueError('Pairwise fusion requires both breast-level classes')
+    uniform = np.full(matrix.shape[1], 1 / matrix.shape[1])
+
+    def loss(weights):
+        margin = difference @ weights
+        change = weights - uniform
+        value = np.logaddexp(0., -margin).mean() + strength * np.square(change).sum()
+        gradient = -(difference.T @ expit(-margin)) / len(margin) + 2 * strength * change
+        return value, gradient
+
+    result = minimize(loss, uniform, method='SLSQP', jac=True, bounds=[(0., 1.)] * len(uniform),
+                      constraints={'type': 'eq', 'fun': lambda value: value.sum() - 1},
+                      options={'ftol': 1e-9, 'maxiter': 100})
+    if not result.success:
+        raise ValueError(f'Pairwise fusion optimization failed: {result.message}')
+    weights = np.maximum(result.x, 0)
+    weights[weights < 1e-5] = 0
+    return weights / weights.sum()
+
+
+def pairwise_candidate(truth, scores, folds, strength):
+    def fit_blend(fit):
+        ranking = sorted(scores, key=lambda name: roc_auc_score(truth[fit, 0], scores[name][fit, 0]), reverse=True)
+        chosen = ranking[:5]
+        calibration = [fit_calibration(truth[fit], scores[key][fit])[0][0] for key in chosen]
+        calibrated = np.column_stack([scores[key][:, 0] * slope + intercept
+                                      for key, (slope, intercept) in zip(chosen, calibration, strict=True)])
+        fractions = fit_pairwise_weights(truth[fit], calibrated[fit], strength)
+        return chosen, calibrated, fractions
+
+    out = np.empty_like(truth, dtype=np.float64)
+    for fit, check in folds:
+        _, calibrated, fractions = fit_blend(fit)
+        out[check, 0] = calibrated[check] @ fractions
+    chosen, _, fractions = fit_blend(np.arange(len(truth)))
+    selected = {key: float(fraction) for key, fraction in zip(chosen, fractions, strict=True) if fraction > 0}
+    return {'weights': selected, 'method': 'calibrated-pairwise-logit', 'weight_strength': strength,
+            'metrics': validation_metrics(truth, out)}
+
+
 def validation_lock(args):
     frame, audit = load_manifest(args.cohort)
     rows = np.flatnonzero(frame.split.eq('val').to_numpy())
@@ -135,6 +180,10 @@ def validation_lock(args):
         if args.task == 'chest' and 'previous-locked' in weights and len(weights) > 1:
             candidates.extend(label_adaptive_candidate(truth, scores, calibrated_scores, weights, folds, strength)
                               for strength in (8, 24))
+    if args.pairwise:
+        if args.task != 'mammo':
+            raise ValueError('Pairwise ranking blend is implemented for the breast-level endpoint')
+        candidates.extend(pairwise_candidate(truth, scores, folds, strength) for strength in (.03, .12, .4))
     candidates.sort(key=lambda item: (item['metrics']['macro_auroc'], item['metrics']['macro_auprc']),
                     reverse=True)
     selected = candidates[0]
@@ -180,23 +229,31 @@ def load_component(work: Path, candidate, weights: Path, clip: Path | None):
         from medimage.auc_fusion import FusionHead, FusionRecipe
 
         model = FusionHead(config['dimensions'], FusionRecipe(**config['recipe']))
+    elif config['backbone'] == 'patch-mil':
+        from medimage.auc_mammo_mil import BreastMIL
+
+        model = BreastMIL(**saved['head'])
     elif config['backbone'] == 'patch-r18':
         model = PatchNet(weights)
     else:
         model = new_model(config, clip if config['backbone'] == 'mammo-clip' else weights)
-    if config['task'] == 'mammo' and model.weight_sha256 != config['weight_sha256']:
+    if config['task'] == 'mammo' and hasattr(model, 'weight_sha256') and model.weight_sha256 != config['weight_sha256']:
         raise ValueError('Mammography foundation differs from the selected recipe')
     model.load_state_dict(saved['model'])
     model.cuda().to(memory_format=torch.channels_last).eval()
     return model, saved
 
 
-def component_logits(model, saved, arrays, rows):
+def component_logits(model, saved, arrays, rows, weights=None):
     from medimage.auc_patches import scan
     from medimage.auc_train import predict
 
     config = saved['config']
-    if config['backbone'] == 'patch-r18':
+    if config['backbone'] == 'patch-mil':
+        from medimage.auc_mammo_mil import predict as predict_mil
+
+        logits = predict_mil(model, saved, arrays, rows, weights)
+    elif config['backbone'] == 'patch-r18':
         logits = scan(model, arrays, rows)[saved['pooling']]
     else:
         logits = predict(model, config['task'], arrays, rows, config['batch'], config['tta'],
@@ -219,7 +276,7 @@ def test_component(args, candidate, rows):
     if signature != candidate['config']['pixel_sha256']:
         raise ValueError('Test pixel representation differs from training')
     model, saved = load_component(args.work, candidate, args.weights, args.clip)
-    return component_logits(model, saved, arrays, rows)
+    return component_logits(model, saved, arrays, rows, args.weights)
 
 
 def prediction_examples(task, frame, rows, truth, probabilities, thresholds, labels):
@@ -240,6 +297,35 @@ def prediction_examples(task, frame, rows, truth, probabilities, thresholds, lab
     return examples
 
 
+def heldout_probabilities(args, lock, digest, rows, labels, truth, reference):
+    import torch
+
+    destination = args.output / 'test-predictions.npz'
+    if destination.exists():
+        with np.load(destination, allow_pickle=False) as existing:
+            if 'selection_sha256' in existing:
+                if existing['selection_sha256'].item() != digest:
+                    raise ValueError('Cached test scores belong to a different locked ensemble')
+                return read_scores(destination, rows, num_labels=len(labels), truth=truth, key='probabilities')
+    selected = lock['selected']
+    scores = {}
+    for key in selected['weights']:
+        print(f'Scoring locked component {key} on {len(rows)} official test examples', flush=True)
+        if key == 'previous-locked':
+            scores[key] = read_scores(reference / 'test-predictions.npz', rows, num_labels=len(labels), truth=truth)
+        else:
+            scores[key] = test_component(args, lock['candidates'][key], rows)
+        torch.cuda.empty_cache()
+    logits = selected_scores(selected, scores, lock['component_calibration'])
+    parameters = np.asarray(lock['ensemble_calibration'])
+    probabilities = expit(logits * parameters[:, 0] + parameters[:, 1])
+    temporary = args.output / 'test-predictions.partial.npz'
+    np.savez_compressed(temporary, rows=rows, labels=truth, probabilities=probabilities,
+                        logits=logits, selection_sha256=digest)
+    temporary.replace(destination)
+    return probabilities
+
+
 def evaluate_lock(args):
     import torch
 
@@ -258,22 +344,14 @@ def evaluate_lock(args):
         raise ValueError('Previous benchmark lock changed')
     before = read_scores(reference / 'test-predictions.npz', rows, num_labels=len(labels), truth=truth,
                          key='probabilities')
-    previous_logits = read_scores(reference / 'test-predictions.npz', rows, num_labels=len(labels), truth=truth)
-    selected = lock['selected']
-    scores = {}
-    for key in selected['weights']:
-        print(f'Scoring locked component {key} on {len(rows)} official test examples', flush=True)
-        scores[key] = previous_logits if key == 'previous-locked' else test_component(args, lock['candidates'][key], rows)
-        torch.cuda.empty_cache()
-    logits = selected_scores(selected, scores, lock['component_calibration'])
-    parameters = np.asarray(lock['ensemble_calibration'])
-    probabilities = expit(logits * parameters[:, 0] + parameters[:, 1])
+    digest = checksum(path)
+    probabilities = heldout_probabilities(args, lock, digest, rows, labels, truth, reference)
     thresholds = np.asarray(lock['thresholds'])
     benchmark = all_metrics(truth, probabilities, thresholds, labels)
     reference_metrics = all_metrics(truth, before, np.asarray(read_json(reference / 'selection.json')['thresholds']), labels)
     bootstrap = patient_bootstrap(truth, probabilities, frame.iloc[rows].patient.to_numpy(),
                                   repeats=args.bootstrap, reference=before)
-    report = {'task': args.task, 'selection_sha256': checksum(path), 'selected': selected, 'test': benchmark,
+    report = {'task': args.task, 'selection_sha256': digest, 'selected': lock['selected'], 'test': benchmark,
               'reference_test': reference_metrics, 'test_uncertainty': bootstrap,
               'auroc_delta': benchmark['macro_auroc'] - reference_metrics['macro_auroc'],
               'examples': prediction_examples(args.task, frame, rows, truth, probabilities, thresholds, labels)}
@@ -283,10 +361,6 @@ def evaluate_lock(args):
         strata = frame.iloc[rows].view.to_numpy()
     report['test_subsets'] = {str(key): all_metrics(truth[strata == key], probabilities[strata == key],
                                                   thresholds, labels) for key in np.unique(strata)}
-    temporary = args.output / 'test-predictions.partial.npz'
-    np.savez_compressed(temporary, rows=rows, labels=truth,
-                        probabilities=probabilities, logits=logits)
-    temporary.replace(args.output / 'test-predictions.npz')
     write_json(args.output / 'metrics.json', report)
     print({key: benchmark[key] for key in ('rows', 'macro_auroc', 'macro_auprc')}, flush=True)
 
@@ -300,6 +374,7 @@ def main():
     parser.add_argument('--candidate', action='append', default=[])
     parser.add_argument('--weights', type=Path)
     parser.add_argument('--clip', type=Path)
+    parser.add_argument('--pairwise', action='store_true', help='Compare convex pairwise-ranking blends on validation')
     parser.add_argument('--bootstrap', type=int, default=1000)
     args = parser.parse_args()
     if args.phase == 'lock':

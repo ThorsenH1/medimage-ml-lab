@@ -35,7 +35,7 @@ class PatchNet(nn.Module):
         self.encoder.eval()
         return self
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
         x = x.float() / 255
         if self.training:
             shape = (len(x), 1, 1, 1)
@@ -45,7 +45,10 @@ class PatchNet(nn.Module):
             x = torch.where(torch.rand(shape, device=x.device) < .5, x.flip(-2), x)
         normalized = ((x - self.mean) / self.std).contiguous(memory_format=torch.channels_last)
         features = self.encoder.forward_features(normalized)
-        return self.head(features.mean((-1, -2)))
+        return features.mean((-1, -2))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.encode(x))
 
 
 def crop(image, y, x, width):
@@ -93,6 +96,29 @@ def training_patches(pixels, boxes, complete, rows, seed: int, repeats: int):
     if len(set(labels)) != 5:
         raise ValueError('Expected background plus four training lesion subtypes')
     return np.stack(patches), np.asarray(labels)
+
+
+def train_patch_epoch(model, arrays, boxes, train, seed, repeats, batch, optimizer, scaler):
+    torch.manual_seed(seed)
+    data, truth = training_patches(arrays['pixels'], boxes, arrays['annotation_available'],
+                                   train, seed, repeats)
+    order = np.random.default_rng(seed + 1000).permutation(len(truth))
+    frequencies = np.bincount(truth, minlength=5) / len(truth)
+    balance = torch.tensor((frequencies.mean() / frequencies) ** .45, device='cuda', dtype=torch.float32)
+    total = torch.zeros((), device='cuda')
+    model.train()
+    for start in range(0, len(order), batch):
+        rows = order[start:start + batch]
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast('cuda', dtype=torch.float16):
+            logits = model(transfer(data, rows)[:, None])
+            loss = F.cross_entropy(logits, transfer(truth, rows), weight=balance, label_smoothing=.035)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        total += loss.detach() * len(rows)
+    return {'patches': len(truth), 'patch_class_counts': np.bincount(truth).tolist(),
+            'train_loss': float(total / len(truth))}
 
 
 @torch.inference_mode()
@@ -161,27 +187,8 @@ def fit(args):
         history, best = saved['history'], saved['best']
     for epoch in range(len(history), args.epochs):
         begin = time.monotonic()
-        seed = args.seed + epoch
-        torch.manual_seed(seed)
-        data, truth = training_patches(arrays['pixels'], boxes, arrays['annotation_available'],
-                                       train, seed, args.repeats)
-        order = np.random.default_rng(seed + 1000).permutation(len(truth))
-        frequencies = np.bincount(truth, minlength=5) / len(truth)
-        balance = torch.tensor((frequencies.mean() / frequencies) ** .45, device='cuda', dtype=torch.float32)
-        total = torch.zeros((), device='cuda')
-        model.train()
-        for start in range(0, len(order), args.batch):
-            rows = order[start:start + args.batch]
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast('cuda', dtype=torch.float16):
-                logits = model(transfer(data, rows)[:, None])
-                loss = F.cross_entropy(logits, transfer(truth, rows), weight=balance, label_smoothing=.035)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            total += loss.detach() * len(rows)
-        summary = {'epoch': epoch + 1, 'patches': len(truth), 'patch_class_counts': np.bincount(truth).tolist(),
-                   'train_loss': float(total / len(truth))}
+        summary = {'epoch': epoch + 1, **train_patch_epoch(model, arrays, boxes, train, args.seed + epoch,
+                                                          args.repeats, args.batch, optimizer, scaler)}
         checkpoint = {'config': config, 'model': model.state_dict(), 'epoch': epoch + 1}
         if (epoch + 1) % 2 == 0 or epoch + 1 == args.epochs:
             print(f'Patch epoch {epoch + 1}: scanning full validation mammograms', flush=True)

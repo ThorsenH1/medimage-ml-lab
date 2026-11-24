@@ -3,10 +3,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytest
+import torch
 from sklearn.model_selection import GroupKFold
 
 from medimage.auc_mammo_data import Geometry
-from medimage.auc_selection import cross_fit_calibration, label_weights, read_scores
+from medimage.auc_mammo_mil import BreastMIL
+from medimage.auc_selection import cross_fit_calibration, fit_pairwise_weights, label_weights, read_scores
 from medimage.auc_train import ResidentPixels
 from medimage.radiography_evaluate import patient_bootstrap
 
@@ -18,6 +20,29 @@ def test_patient_bootstrap_accepts_integer_benchmark_labels():
     result = patient_bootstrap(labels, scores, np.arange(4), repeats=40, reference=baseline)
     assert result['macro_auroc_ci95'] == [1., 1.]
     assert result['paired_auroc_delta_ci95'] == [0., 0.]
+
+
+def test_pairwise_fusion_prefers_the_better_ranker_on_its_fit_rows():
+    labels = np.array([[0], [1], [0], [1]], dtype=np.int8)
+    model_logits = np.array([[-2, 2], [2, -2], [-1, 1], [1, -1]], dtype=float)
+    weights = fit_pairwise_weights(labels, model_logits, strength=.1)
+    assert weights[0] > weights[1]
+    assert np.all(weights >= 0)
+    np.testing.assert_allclose(weights.sum(), 1.)
+
+
+def test_breast_attention_ignores_unavailable_projections():
+    model = BreastMIL(24, .2).eval()
+    rng = torch.Generator().manual_seed(64)
+    bags = torch.randn(2, 2, 13, 520, generator=rng)
+    mask = torch.zeros(2, 2, 13, dtype=torch.bool)
+    mask[0, 0, :4] = True
+    mask[1, 1, :5] = True
+    with torch.inference_mode():
+        baseline = model(bags, mask)
+        perturbed = model(bags.masked_fill(~mask[..., None], 10.), mask)
+    assert torch.isfinite(baseline).all()
+    torch.testing.assert_close(baseline, perturbed)
 
 
 def test_mammography_mask_uses_the_same_crop_flip_and_canvas():

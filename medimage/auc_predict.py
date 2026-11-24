@@ -55,7 +55,7 @@ def evaluate(args):
                 correction = np.asarray(saved['prior_correction'], dtype=np.float32)
                 logits[name] = raw_prediction(model, saved['config'], pixels['pixels'], args.weights, correction)
             else:
-                logits[name] = component_logits(model, saved, pixels, np.zeros(1, dtype=np.int64))
+                logits[name] = component_logits(model, saved, pixels, np.zeros(1, dtype=np.int64), args.weights)
             del model
         torch.cuda.empty_cache()
     combined = selected_scores(selected, logits, lock['component_calibration'])[0]

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import timm
 import torch
 import torch.nn.functional as F
+from safetensors.torch import load_file
 from torch import nn
 from torchvision.models import densenet121
 from torchvision.models.densenet import DenseNet, _DenseBlock, _DenseLayer, _Transition
@@ -23,6 +24,7 @@ from medimage.search_features import Encoder
 CHEX_HASH = '1a914ae802170187a4852e594708206c12468eeeefd66aa4e8e26141649d61a4'
 DENSE_HASH = 'a639ec97d7c33b07ae66f0b5fb7d0192f95a3b11b7576c66c0126c2a727c4395'
 MAMMO_CLIP_HASH = '0baccb0cc19cd6093ff8252f7c2b7a6efbc32973498640abcb311210c46fd02c'
+EFFICIENTNET_B3_HASH = '279d2a53898aa89dab43fd6bd7df9f706aea4cb9cf916223988bbcb8e5850469'
 
 
 def chest_weights(path: Path, source: str) -> dict:
@@ -159,7 +161,7 @@ class ChestReference(ChestClassifier):
 
 class MammographySpatial(nn.Module):
     def __init__(self, backbone: str, resolution: int, weights: Path, depth: int, dropout: float,
-                 pyramid: bool = False, initialize: bool = True) -> None:
+                 pyramid: bool = False, initialize: bool = True, specialize: bool = False) -> None:
         super().__init__()
         if backbone == 'mammo-clip':
             self.encoder = (mammo_clip(weights) if initialize else
@@ -168,6 +170,19 @@ class MammographySpatial(nn.Module):
             mean = torch.full((1, 1, 1, 1), .3089279)
             std = torch.full((1, 1, 1, 1), .250535554)
             self.rgb = True
+        elif backbone == 'effb3':
+            self.encoder = timm.create_model('efficientnet_b3.ra2_in1k', pretrained=False, num_classes=0)
+            self.weight_sha256 = EFFICIENTNET_B3_HASH
+            if initialize:
+                if checksum(weights) != self.weight_sha256:
+                    raise ValueError('EfficientNet-B3 weights differ from the pinned ImageNet release')
+                state = {name: value for name, value in load_file(weights).items()
+                         if not name.startswith('classifier.')}
+                self.encoder.load_state_dict(state)
+            settings = timm.data.resolve_model_data_config(self.encoder)
+            mean = torch.tensor(settings['mean'])[None, :, None, None]
+            std = torch.tensor(settings['std'])[None, :, None, None]
+            self.rgb = False
         else:
             foundation = Encoder(backbone, resolution, weights)
             self.encoder = foundation.model
@@ -177,7 +192,7 @@ class MammographySpatial(nn.Module):
         self.register_buffer('mean', mean, persistent=False)
         self.register_buffer('std', std, persistent=False)
         self.encoder.requires_grad_(False)
-        if backbone in ('effb0', 'mammo-clip'):
+        if backbone in ('effb0', 'effb3', 'mammo-clip'):
             layers = [*self.encoder.blocks[-depth:], self.encoder.conv_head, self.encoder.bn2]
         elif backbone in ('r18', 'r50'):
             layers = [self.encoder.layer4] if depth == 1 else [self.encoder.layer3, self.encoder.layer4]
@@ -198,6 +213,12 @@ class MammographySpatial(nn.Module):
         self.view_type = nn.Parameter(torch.zeros(2, 128))
         self.token_score = nn.Linear(128, 1)
         self.head = nn.Sequential(nn.LayerNorm(256), nn.Dropout(dropout), nn.Linear(256, 1))
+        self.specialize = specialize
+        if specialize:
+            self.router = nn.Linear(256, 2)
+            self.offset = nn.Linear(256, 2)
+            nn.init.zeros_(self.offset.weight)
+            nn.init.zeros_(self.offset.bias)
         self.resolution = resolution
 
     def train(self, mode: bool = True):
@@ -205,7 +226,7 @@ class MammographySpatial(nn.Module):
         self.encoder.eval()
         return self
 
-    def forward(self, pixels: torch.Tensor, observed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, pixels: torch.Tensor, observed: torch.Tensor):
         batch, views, height, width = pixels.shape
         x = pixels.reshape(batch * views, 1, height, width).float() / 255
         target_size = (self.resolution, self.resolution * 5 // 8)
@@ -244,7 +265,15 @@ class MammographySpatial(nn.Module):
         token_logits = self.token_score(token).squeeze(-1).masked_fill(~observed, -torch.inf)
         fused = (token * token_logits.softmax(dim=-1).unsqueeze(-1)).sum(dim=1)
         maximum = token.masked_fill(~observed[..., None], -torch.inf).amax(dim=1)
-        return self.head(torch.cat((fused, maximum), dim=-1)), lesion.reshape(batch, views, 4, *lesion.shape[-2:])
+        embedding = torch.cat((fused, maximum), dim=-1)
+        logits = self.head(embedding)
+        lesion = lesion.reshape(batch, views, 4, *lesion.shape[-2:])
+        if not self.specialize:
+            return logits, lesion
+        routing = self.router(embedding).float()
+        experts = logits.float() + self.offset(embedding).float()
+        probability = (routing.softmax(1) * experts.sigmoid()).sum(1, keepdim=True)
+        return torch.logit(probability.clamp(1e-6, 1 - 1e-6)), lesion, routing, experts
 
 
 def spatial_loss(logits: torch.Tensor, masks: torch.Tensor, available: torch.Tensor) -> torch.Tensor:
