@@ -32,12 +32,12 @@ def make_figures(chest: dict, mammo: dict, spine: dict, output: Path) -> None:
     axes[0].set_yticks(y, [name.replace('_', ' ') for name, _ in labels], fontsize=9)
     axes[0].scatter([value['auprc'] for _, value in labels], y, color=accent, label='AP', zorder=3)
     axes[0].scatter([value['prevalence'] for _, value in labels], y, color=neutral, marker='|', s=95,
-                    label='Prevalens', zorder=2)
-    axes[0].set(title='Thorax · 14 etiketter', xlabel='Gjennomsnittlig presisjon', xlim=(0, 1))
+                    label='Prevalence', zorder=2)
+    axes[0].set(title='Chest X-ray · 14 findings', xlabel='Average precision', xlim=(0, 1))
     axes[0].legend(loc='lower right', frameon=False)
-    groups = [('Alle bryster', mammo['test_calibrated'])]
-    for key, title in (('both_views', 'Begge projeksjoner'), ('single_view', 'Én projeksjon'),
-                       ('mass_only', 'Masse'), ('calcification_only', 'Forkalkning')):
+    groups = [('All breasts', mammo['test_calibrated'])]
+    for key, title in (('both_views', 'Both views'), ('single_view', 'Single view'),
+                       ('mass_only', 'Mass'), ('calcification_only', 'Calcification')):
         subset = mammo['test_subgroups'].get(key)
         if subset and subset['macro_auroc'] is not None:
             groups.append((title, subset))
@@ -47,10 +47,10 @@ def make_figures(chest: dict, mammo: dict, spine: dict, output: Path) -> None:
     low, high = mammo['patient_bootstrap']['macro_auroc_ci95']
     axes[1].hlines(1, low, high, color=accent, linewidth=2)
     axes[1].axvline(.5, color='gray', linestyle=':')
-    axes[1].set(title='Mammografi · holdt ute test', xlabel='AUROC', xlim=(.35, 1), ylim=(len(groups) + .65, .35))
+    axes[1].set(title='Mammography · test cohort', xlabel='AUROC', xlim=(.35, 1), ylim=(len(groups) + .65, .35))
     items = [(name, record['overall']['score']) for name, record in spine['assessments'].items()]
-    subtitles = {'prior': 'Klasseprior', 'localized': 'Lokalisert 2,5D', 'global_reference': 'Global 2,5D',
-                 'equal_weight_blend': '50/50-blanding'}
+    subtitles = {'prior': 'Class prior', 'localized': 'Localized 2.5D', 'global_reference': 'Global 2.5D',
+                 'equal_weight_blend': '50/50 blend'}
     indices = range(len(items))
     axes[2].barh(indices, [item[1] for item in items],
                  color=[accent if item[0] == spine['selected_for_local_inference'] else '#a1b5be' for item in items])
@@ -58,7 +58,7 @@ def make_figures(chest: dict, mammo: dict, spine: dict, output: Path) -> None:
     for index, (_name, value) in enumerate(items):
         axes[2].text(value + .015, index, f'{value:.3f}', va='center', fontsize=9)
     axes[2].invert_yaxis()
-    axes[2].set(title='Korsrygg · femfolds OOF', xlabel='Vektet log loss (lavere er bedre)', xlim=(0, max(v for _, v in items) * 1.16))
+    axes[2].set(title='Lumbar MRI · five-fold OOF', xlabel='Weighted log loss (lower is better)', xlim=(0, max(v for _, v in items) * 1.16))
     for axis in axes:
         axis.title.set_ha('left')
         axis.title.set_position((0, 1.05))
@@ -73,10 +73,10 @@ def report(artifacts: Path, output: Path) -> None:
     spine_inference = read_json(artifacts / 'inference' / 'spine.json')
     output.mkdir(parents=True, exist_ok=True)
     make_figures(chest, mammo, spine, output)
-    lines = ['# Resultater', '', '![Aggregerte resultater for thorax, mammografi og korsrygg](results.png)', '',
-             'Resultatene gjelder tre forskjellige forskningsoppgaver og datasett.', '',
-             '## NIH ChestX-ray14 og CBIS-DDSM', '',
-             '| Testsett | Valgt modell | Antall | AUROC (95 % KI) | Gjennomsnittlig presisjon (95 % KI) | Brier før → etter |',
+    lines = ['# Initial research benchmarks', '', '![Aggregate results for chest X-ray, mammography, and lumbar MRI](results.png)', '',
+             'Each panel uses a task-specific dataset and metric.', '',
+             '## NIH ChestX-ray14 and CBIS-DDSM', '',
+             '| Benchmark | Selected model | Samples | AUROC (95% CI) | Average precision (95% CI) | Brier before → after |',
              '| --- | --- | ---: | ---: | ---: | ---: |']
     for data, name in ((chest, 'NIH ChestX-ray14'), (mammo, 'CBIS-DDSM')):
         raw, result, ci = data['test_raw'], data['test_calibrated'], data['patient_bootstrap']
@@ -84,12 +84,12 @@ def report(artifacts: Path, output: Path) -> None:
                      f'{result["macro_auroc"]:.3f} ({_interval(ci["macro_auroc_ci95"])}) | '
                      f'{result["macro_auprc"]:.3f} ({_interval(ci["macro_auprc_ci95"])}) | '
                      f'{raw["macro_brier"]:.4f} → {result["macro_brier"]:.4f} |')
-    lines.extend(['', 'Thorax bruker makrogjennomsnittet over 14 etiketter. Mammografi bruker én malignitetsvariabel. '
-                  'Intervallene bruker 400 trekk med tilbakelegging av hele pasientgrupper. Thoraxgrupper slår sammen pasient-ID-er som deler identiske bilder.', '',
-                  'Brier-tapet måler gjennomsnittlig kvadratfeil for de predikerte sannsynlighetene. '
-                  'Sammenlign før og etter på hvert testsett for å se hvordan kalibreringen overføres fra valideringssettet.', '',
-                  '### Valideringsforsøk', '',
-                  '| Forsøk | Epoke | AUROC | Gjennomsnittlig presisjon | Trente epoker | Minutter | Maks reservert VRAM |',
+    lines.extend(['', 'Chest X-ray uses macro averages over 14 findings. Mammography uses one malignancy endpoint. '
+                  'Intervals use 400 resamples of entire patient groups. Chest X-ray groups merge IDs linked by identical images.', '',
+                  'The Brier score measures mean squared probability error. '
+                  'The before-and-after values show how validation-fitted calibration transfers to each benchmark.', '',
+                  '### Validation runs', '',
+                  '| Run | Selected epoch | AUROC | Average precision | Training epochs | Minutes | Peak reserved VRAM |',
                   '| --- | ---: | ---: | ---: | ---: | ---: | ---: |'])
     for data in (chest, mammo):
         for variant in data['selection']['variants']:
@@ -100,39 +100,39 @@ def report(artifacts: Path, output: Path) -> None:
             minutes = sum(item['seconds'] for item in history) / 60.
             lines.append(f'| `{variant["run"]}` | {val["epoch"]} | {val["macro_auroc"]:.3f} | '
                          f'{val["macro_auprc"]:.3f} | {len(history)} | {minutes:.1f} | {peak / 1024:.2f} GiB |')
-    lines.extend(['', '### Etiketter og projeksjoner', '',
-                  '| Thoraxetikett | Positive testbilder | AUROC | Gjennomsnittlig presisjon |',
+    lines.extend(['', '### Chest X-ray findings', '',
+                  '| Finding | Positive test images | AUROC | Average precision |',
                   '| --- | ---: | ---: | ---: |'])
     for name, values in chest['test_calibrated']['labels'].items():
         lines.append(f'| {name.replace("_", " ")} | {values["positives"]:,} | {values["auroc"]:.3f} | {values["auprc"]:.3f} |')
     lines.extend(['', '## RSNA LumbarDISC', '',
-                  '| Modell | Samlet OOF | Spinal | Foraminal | Subartikulær | Alvorlig spinal |',
+                  '| Modell | Overall OOF | Spinal | Foraminal | Subarticular | Any severe spinal |',
                   '| --- | ---: | ---: | ---: | ---: | ---: |'])
     for name, record in spine['assessments'].items():
         keys = ('score', 'spinal', 'foraminal', 'subarticular', 'any_severe_spinal')
         lines.append(f'| `{name}` | ' + ' | '.join(f'{record["overall"][key]:.5f}' for key in keys) + ' |')
-    lines.extend(['', '### Foldresultater', '',
+    lines.extend(['', '### Fold results', '',
                   '| Modell | Fold 0 | Fold 1 | Fold 2 | Fold 3 | Fold 4 |',
                   '| --- | ---: | ---: | ---: | ---: | ---: |'])
     for name, record in spine['assessments'].items():
         lines.append(f'| `{name}` | ' + ' | '.join(f'{fold["score"]:.5f}' for fold in record['per_fold']) + ' |')
     comparison = spine['assessments'].get('equal_weight_blend')
     if comparison:
-        lines.extend(['', '95 % parvise bootstrapintervaller for endring i tap mot global referanse.', ''])
+        lines.extend(['', '95% paired bootstrap intervals for loss differences against the global reference.', ''])
         for name in ('localized', 'equal_weight_blend'):
             record = spine['assessments'][name]
-            lines.append(f'- `{name}` {_interval(record["paired_delta_ci95_vs_global"])} og {record["folds_beating_global"]} av 5 bedre folder.')
+            lines.append(f'- `{name}` {_interval(record["paired_delta_ci95_vs_global"])} and {record["folds_beating_global"]} of 5 folds improved.')
     local = spine['localization']
     fold0 = spine['fold_experiments'][0]
     oracle = fold0['oracle_coordinates_sensitivity_only']['score']
     regular = fold0['validation']['score']
-    lines.extend(['', f'Valgt inferenskonfigurasjon er `{spine["selected_for_local_inference"]}`. '
-                  f'Rå DICOM til CSV ble verifisert på {spine_inference["study_count"]} undersøkelse med {spine_inference["rows"]} rader.', '',
-                  f'Medianen for landemerkeavvik var {local["median_anchor_error_mm"]:.2f} mm, mot {local["atlas_only_median_anchor_error_mm"]:.2f} mm for den statiske referansen. '
-                  f'{local["within_10mm"]:.1%} av landemerkene lå innenfor 10 mm. '
-                  f'{local["missing_primary_roi_fraction"]:.2%} av primærutsnittene hadde manglende sekvens.', '',
-                  f'På fold 0 var tapet {regular:.5f} med estimerte koordinater og {oracle:.5f} med tilgjengelige annoterte koordinater. '
-                  f'Utforskende kalibrering på de lagrede OOF-prediksjonene ga {spine["exploratory_cross_fold_calibration"]["score"]["score"]:.5f}.', ''])
+    lines.extend(['', f'The selected inference configuration is `{spine["selected_for_local_inference"]}`. '
+                  f'Raw-DICOM-to-CSV inference was verified on {spine_inference["study_count"]} study with {spine_inference["rows"]} rows.', '',
+                  f'Median landmark error was {local["median_anchor_error_mm"]:.2f} mm, versus {local["atlas_only_median_anchor_error_mm"]:.2f} mm for the static reference. '
+                  f'{local["within_10mm"]:.1%} of landmarks were within 10 mm. '
+                  f'{local["missing_primary_roi_fraction"]:.2%} of primary regions had a missing view.', '',
+                  f'On fold 0 the loss was {regular:.5f} with estimated coordinates and {oracle:.5f} with available annotated coordinates. '
+                  f'Exploratory calibration on saved OOF predictions yielded {spine["exploratory_cross_fold_calibration"]["score"]["score"]:.5f}.', ''])
     (output / 'results.md').write_text('\n'.join(lines), encoding='utf-8', newline='\n')
 
 

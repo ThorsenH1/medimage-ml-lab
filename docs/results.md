@@ -1,32 +1,32 @@
-# Resultater
+# Initial research benchmarks
 
-![Aggregerte resultater for thorax, mammografi og korsrygg](results.png)
+![Aggregate results for chest X-ray, mammography, and lumbar MRI](results.png)
 
-Resultatene gjelder tre forskjellige forskningsoppgaver og datasett.
+Each panel uses a task-specific dataset and metric.
 
-## NIH ChestX-ray14 og CBIS-DDSM
+## NIH ChestX-ray14 and CBIS-DDSM
 
-| Testsett | Valgt modell | Antall | AUROC (95 % KI) | Gjennomsnittlig presisjon (95 % KI) | Brier før → etter |
+| Benchmark | Selected model | Samples | AUROC (95% CI) | Average precision (95% CI) | Brier before → after |
 | --- | --- | ---: | ---: | ---: | ---: |
 | NIH ChestX-ray14 | `chest-global` | 25,596 | 0.779 (0.771–0.786) | 0.239 (0.228–0.252) | 0.0823 → 0.0592 |
 | CBIS-DDSM | `mammo-global` | 336 | 0.686 (0.625–0.742) | 0.637 (0.567–0.712) | 0.2177 → 0.2180 |
 
-Thorax bruker makrogjennomsnittet over 14 etiketter. Mammografi bruker én malignitetsvariabel. Intervallene bruker 400 trekk med tilbakelegging av hele pasientgrupper. Thoraxgrupper slår sammen pasient-ID-er som deler identiske bilder.
+Chest X-ray uses macro averages over 14 findings. Mammography uses one malignancy endpoint. Intervals use 400 resamples of entire patient groups. Chest X-ray groups merge IDs linked by identical images.
 
-Brier-tapet måler gjennomsnittlig kvadratfeil for de predikerte sannsynlighetene. Sammenlign før og etter på hvert testsett for å se hvordan kalibreringen overføres fra valideringssettet.
+The Brier score measures mean squared probability error. The before-and-after values show how validation-fitted calibration transfers to each benchmark.
 
-### Valideringsforsøk
+### Validation runs
 
-| Forsøk | Epoke | AUROC | Gjennomsnittlig presisjon | Trente epoker | Minutter | Maks reservert VRAM |
+| Run | Selected epoch | AUROC | Average precision | Training epochs | Minutes | Peak reserved VRAM |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `chest-global` | 4 | 0.815 | 0.215 | 5 | 23.0 | 1.23 GiB |
 | `chest-attention` | 4 | 0.815 | 0.214 | 7 | 32.4 | 1.24 GiB |
 | `mammo-global` | 2 | 0.738 | 0.742 | 12 | 2.2 | 0.91 GiB |
 | `mammo-attention` | 5 | 0.725 | 0.711 | 14 | 12.8 | 2.89 GiB |
 
-### Etiketter og projeksjoner
+### Chest X-ray findings
 
-| Thoraxetikett | Positive testbilder | AUROC | Gjennomsnittlig presisjon |
+| Finding | Positive test images | AUROC | Average precision |
 | --- | ---: | ---: | ---: |
 | Atelectasis | 3,279 | 0.750 | 0.312 |
 | Cardiomegaly | 1,069 | 0.867 | 0.317 |
@@ -45,14 +45,14 @@ Brier-tapet måler gjennomsnittlig kvadratfeil for de predikerte sannsynligheten
 
 ## RSNA LumbarDISC
 
-| Modell | Samlet OOF | Spinal | Foraminal | Subartikulær | Alvorlig spinal |
+| Modell | Overall OOF | Spinal | Foraminal | Subarticular | Any severe spinal |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `prior` | 0.92947 | 0.80020 | 0.88889 | 1.07568 | 0.95310 |
 | `localized` | 0.61268 | 0.47517 | 0.66740 | 0.73272 | 0.57543 |
 | `global_reference` | 0.64654 | 0.55763 | 0.72677 | 0.81204 | 0.48973 |
 | `equal_weight_blend` | 0.53069 | 0.40842 | 0.63264 | 0.69652 | 0.38517 |
 
-### Foldresultater
+### Fold results
 
 | Modell | Fold 0 | Fold 1 | Fold 2 | Fold 3 | Fold 4 |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -61,13 +61,13 @@ Brier-tapet måler gjennomsnittlig kvadratfeil for de predikerte sannsynligheten
 | `global_reference` | 0.64696 | 0.62774 | 0.65868 | 0.65080 | 0.64871 |
 | `equal_weight_blend` | 0.53890 | 0.52827 | 0.55223 | 0.51745 | 0.51634 |
 
-95 % parvise bootstrapintervaller for endring i tap mot global referanse.
+95% paired bootstrap intervals for loss differences against the global reference.
 
-- `localized` -0.063–-0.005 og 4 av 5 bedre folder.
-- `equal_weight_blend` -0.125–-0.106 og 5 av 5 bedre folder.
+- `localized` -0.063–-0.005 and 4 of 5 folds improved.
+- `equal_weight_blend` -0.125–-0.106 and 5 of 5 folds improved.
 
-Valgt inferenskonfigurasjon er `equal_weight_blend`. Rå DICOM til CSV ble verifisert på 1 undersøkelse med 25 rader.
+The selected inference configuration is `equal_weight_blend`. Raw-DICOM-to-CSV inference was verified on 1 study with 25 rows.
 
-Medianen for landemerkeavvik var 7.32 mm, mot 16.19 mm for den statiske referansen. 67.6% av landemerkene lå innenfor 10 mm. 0.05% av primærutsnittene hadde manglende sekvens.
+Median landmark error was 7.32 mm, versus 16.19 mm for the static reference. 67.6% of landmarks were within 10 mm. 0.05% of primary regions had a missing view.
 
-På fold 0 var tapet 0.62298 med estimerte koordinater og 0.56182 med tilgjengelige annoterte koordinater. Utforskende kalibrering på de lagrede OOF-prediksjonene ga 0.53624.
+On fold 0 the loss was 0.62298 with estimated coordinates and 0.56182 with available annotated coordinates. Exploratory calibration on saved OOF predictions yielded 0.53624.

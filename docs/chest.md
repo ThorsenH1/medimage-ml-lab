@@ -1,27 +1,19 @@
 # NIH ChestX-ray14
 
-Oppgaven gir 14 binære utganger for hvert frontale thoraxbilde. Modellen med etikettspesifikke spørringer leser lokale trekk på et 5 × 5-gitter, modellerer samspill mellom etiketter og legger stedsinformasjonen til den globale utgangen. Den globale referansen bruker samme ResNet-18-stamme. Oppskriftene har ulike epokebudsjetter og OneCycle-planer, så resultatforskjellen gjelder de fullstendige oppskriftene.
+The task produces 14 binary scores per frontal chest radiograph. The original attention model uses label-specific queries over a 5 × 5 feature grid and models interactions between labels. The global comparison shares its ResNet-18 backbone. Their epoch budgets and OneCycle schedules differ, so the results compare complete training recipes.
 
-## Kohort og validering
+## Cohort and validation
 
-Alle 112 120 bilder i de offisielle listene ble identifisert. Fem grupper av identiske originalbilder forekom på tvers av den første inndelingen, med ulike pasient-ID-er. Den endelige inndelingen grupperer slike aliaser sammen. Fire utviklingspasienter med til sammen 29 bilder ble ekskludert fordi gruppene deres forekom i det offisielle testsettet. Testlista ble beholdt i sin helhet.
+All 112,120 images in the source lists were identified. An audit found five groups of pixel-identical originals across the first partition under different patient IDs. The final split groups these aliases together. Four development patient IDs covering 29 images were dropped because their groups occurred in the official test set. The complete official test list was retained. The absence of cross-partition pixel duplicates was also verified at 224 pixels.
 
-Treningsdelen består av 76 084 bilder fra 24 643 pasient-ID-er. En iterativ multilabel-splitt på grupper gir 10 411 valideringsbilder fra 3 361 andre pasient-ID-er. Offisielt testsett består av 25 596 bilder fra 2 797 pasient-ID-er, organisert i 2 795 grupper etter koblinger fra identiske bilder. Valideringen har 22 bilder med hernie, så usikkerheten for den sjeldne etiketten er høy.
+The final cohort has 76,084 training images from 24,643 patient IDs and 10,411 validation images from 3,361 other patient IDs. Test has 25,596 images from 2,797 patient IDs in 2,795 exact-image-linked clusters. The validation set contains 22 positive hernia images.
 
-Epoken og modellen velges etter gjennomsnittet av makro-AUROC og makro-gjennomsnittlig presisjon på valideringssettet. Hver etikett kalibreres separat med logistisk skalering. Rapporten måler rangering, kalibrering, resultater for undergrupper og pasientklustrede bootstrap-intervaller. Valideringsbaserte F1-grenser brukes bare til å beskrive testytelse.
+The selection criterion averages macro AUROC and macro average precision. Each label receives logistic calibration fitted on validation. Evaluation reports ranking, calibration, acquisition-view and demographic subgroups, and patient-cluster bootstrap intervals. Validation-derived F1 thresholds describe benchmark behavior.
 
-## Begrensninger og utdanningsverdi
+## Limitations and learning objectives
 
-Etikettene kommer fra journalrapporter. Den innlærte rangeringen kan reflektere opptaksprojeksjon, behandlingsutstyr og bildemønstre som samvarierer med funnet. AP-/PA-, alders- og kjønnsanalysene beskriver observerte forskjeller i datasettet. Ekstern sykehusvalidering, klinisk terskelvalg og prospektiv evaluering krever egne studier. [NIH-kilden](https://nihcc.app.box.com/v/ChestXray-NIHCC) · [RSNA-datakort](https://atlas.rsna.org/cards/66962171-1dcb-431d-89b0-08a561f1c8ed)
+Labels were extracted from reports. Acquisition view, equipment, and correlated findings can affect ranking. AP/PA, age, and sex analyses describe subgroup behavior on this dataset. The project illustrates how precision, prevalence, and repeated observations per patient affect interpretation. [NIH dataset](https://nihcc.app.box.com/v/ChestXray-NIHCC) · [RSNA data card](https://atlas.rsna.org/cards/66962171-1dcb-431d-89b0-08a561f1c8ed)
 
-Prosjektet viser hvorfor presisjon–recall, prevalens og kalibrering må leses sammen og hvordan gjentatte bilder per pasient påvirker usikkerheten.
+## Inference
 
-## Inferens
-
-Trenings- og evalueringsskriptet skriver `evaluation-plan.json` med det valgte modellnavnet. Bruk dette navnet i checkpointbanen.
-
-```powershell
-& $p -m medimage.radiography_predict --checkpoint artifacts/runs/chest-global/best.pt `
-  --calibration artifacts/evaluation/chest/calibration.json --image 'C:\bilder\frontalbilde.png' `
-  --output artifacts/inference/chest.json
-```
+Use the locked model plan and its checkpoint roots. The [shared README](../README.md) shows the prediction command. The [project repository](https://github.com/ThorsenH1/chest-xray14-ml) includes a synthetic example. [Initial results](results.md) · [Extended search](model-search.md)

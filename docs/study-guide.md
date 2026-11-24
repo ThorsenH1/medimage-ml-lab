@@ -1,19 +1,19 @@
-# Faglig gjennomgang
+# Study guide
 
-Bruk [resultatrapporten](results.md) og [forskningskildene](research.md) som utgangspunkt for å presentere prosjektene.
+Use the [initial results](results.md), [extended search report](model-search.md), and [research sources](research.md) to prepare a project presentation.
 
-| Tema | Eksempel i prosjektet | Spørsmål å drøfte |
+| Topic | Example | Question |
 | --- | --- | --- |
-| Bildefysikk | MR-utsnitt styres av fysisk bredde i millimeter og en lokal basis for hver DICOM-skive | Hvordan endrer anisotrop pikselavstand et kvadratisk utsnitt definert i pikselkoordinater? |
-| Representativt utvalg | CBIS-DDSM inkluderer bryster som allerede har annoterte lesjoner | Hva skjer med presisjon og kalibrering når prevalensen endres i en screeningpopulasjon? |
-| Datalekkasje | Samme pasient kan ha flere bilder. En separat lokaliseringsmodell kan også lære den samme pasientens koordinater | Hvilke nivåer må holdes ute når et trent system leverer input til neste modell? |
-| Ubalanse | Thoraxprosjektet rapporterer AUROC, gjennomsnittlig presisjon og prevalens for alle 14 etiketter | Hvilke etiketter rangeres godt samtidig som den absolutte presisjonen er lav? |
-| Modellvalg | Global pooling og oppmerksomhet sammenlignes på valideringssettet før test | Hvilke bevis kreves for at mer kompleks arkitektur skal overta? |
-| Usikkerhet | Bootstrapping trekker hele pasienter og sammenligner MR-modellene med de samme studiene | Hvorfor kan intervallene bli misvisende hvis man trekker enkeltbilder? |
+| Image geometry | MRI crops use a physical width and a local DICOM basis | How does anisotropic spacing change a square crop defined in pixels? |
+| Sampling | CBIS-DDSM includes breasts with annotated lesions | How would precision and calibration change at screening prevalence? |
+| Leakage | Patients contribute multiple images and a localizer can learn a study's coordinates | Which datasets must be held out when one trained stage supplies inputs to the next? |
+| Class imbalance | Chest X-ray evaluation reports AUROC, average precision, and prevalence | Which conditions rank reasonably well while absolute precision stays low? |
+| Model selection | The search varies architecture, learning rate, regularization, and training duration | What evidence justifies promoting a more complex model? |
+| Uncertainty | Bootstrap samples preserve whole patient clusters and pair MRI predictions | How could sampling individual images change the interval? |
 
-## Reproduserbar analyse
+## Practical analyses
 
-1. Undersøk dataauditen og forklar hvordan kohorten ble satt sammen. Vis hvordan en pasientidentifikator påvirker inndelingen uten å ta med pasientnivårader i presentasjonen.
-2. Tegn tre trinn fra råbilde til sannsynlighet for hvert prosjekt. Forklar hvilke parametere som ble lært fra data og hvilke regler som var fastlagt.
-3. Velg ett resultat som utfordrer den opprinnelige hypotesen. Vis valideringsmålet, hvilke alternativer det sammenligner og hvordan valget ble låst før test.
-4. Diskuter hva et lokalt testresultat sier om målpopulasjonen, og hvilke data som mangler for å måle overførbarhet til andre institusjoner.
+1. Describe how each cohort was assembled and how grouping affects the split. Use aggregate counts in the presentation.
+2. Trace each pipeline from raw image to probabilities. Identify fitted parameters and fixed preprocessing rules.
+3. Choose a result that challenged your hypothesis. Explain what was measured on validation before the benchmark.
+4. Discuss the population represented by each benchmark and the data needed to estimate transfer to a different institution.

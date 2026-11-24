@@ -1,49 +1,32 @@
-# RSNA LumbarDISC MR korsrygg
+# RSNA LumbarDISC lumbar MRI
 
-Modellen beregner tre ordnede grader for 25 kombinasjoner av funn og nivå. De tre bildeseriene er sagittal T2/STIR, sagittal T1 og aksial T2. Pipeline leser pikselavstand, bildeposisjon og orientering og konverterer resamplede koordinater tilbake til pasientrom i millimeter.
+The system predicts three grades for five condition/side categories at five lumbar levels. The inputs are sagittal T2/STIR, sagittal T1, and axial T2. DICOM spacing, position, and orientation map resampled pixels back to physical coordinates.
 
-## Lokalisering og klassifisering
+## Localization and grading
 
-1. Sentralsagittale bildebeskrivelser brukes i en kjernemodell for fem landemerkepunkter. RBF-regresjonen kombinerer to båndbredder og bruker en median fra sine treningsfolder som reserve.
-2. Avstander mellom landemerkene og målposisjonene estimeres på treningsfoldene. Det resulterende atlaset overfører landemerker til venstre og høyre foramina og subartikulære områder.
-3. Målpunktene projiseres på aktuelle serier i millimeter. Hvert 2,5D-utsnitt består av tre bildesnitt. Manglende serier gir et eksplisitt fraværsignal.
-4. En delt ResNet-18 koder utsnittene. Oppmerksomheten kombinerer nivå, funntype, bildekontekst og lokaliseringskvalitet. Tapet vekter alvorlige grader og modellerer ordinal avstand og alvorlig stenose i studiet som helhet.
+1. A kernel model estimates five mid-sagittal landmarks from image descriptors. It mixes two RBF bandwidths and has a training-fold median fallback.
+2. A fold-specific atlas estimates offsets from those landmarks to the foraminal and subarticular targets.
+3. The targets are projected into their views in millimeters. Each 2.5D crop contains adjacent slices. Missing views have an explicit mask.
+4. A shared ResNet-18 encodes cropped regions. Attention combines levels, conditions, and localization quality. The loss combines severity-weighted cross-entropy, an ordinal component, and a study-level severe spinal canal signal.
 
-## Kontroll mot datalekkasje
+## Validation and leakage controls
 
-De historiske fem foldene på 1 975 undersøkelser brukes uendret. For hver ytre fold bruker lokaliseringen av valideringsbildene de fire andre foldene. Lokaliseringen av et treningsbilde holder ute både bildets egen fold og den ytre valideringsfolden. De 15 forskjellige fittene lagrer opphavet til hver ROI. Dermed bruker også klassifikatorens treningsbilder estimerte landemerker. Ytre valideringsetiketter inngår i rapportering, mens sluttvektene følger et fast treningsforløp og gjennomsnittet av de siste tre epokene.
+The cohort contains 1,975 studies on five frozen folds. The outer held-out fold is excluded from locator fitting. The train row's own fold is excluded when generating that row's crop. During hyperparameter search, the inner validation fold is also excluded when preparing inner training crops. The pipeline checks these provenance masks before fitting. The initial fold-0 sensitivity analysis evaluates the same classifier with known coordinates to measure the effect of localization quality.
 
-Tilgjengelige valideringsannotasjoner brukes i ett eksplisitt følsomhetsforsøk på fold 0. Det måler hvor mye samme modell endrer seg når koordinatene er kjent. Det oppgis separat i resultatene.
+The exact RSNA weighted log loss is the primary metric. The historical reference uses five uniformly spaced 224-pixel slices per series, a shared global ResNet-18, and mean pooling. Promotion requires improvement on at least three folds and an upper paired bootstrap bound below zero.
 
-## Evaluering og inferens
+The local test contains one unlabeled study. The integration test checks 25 rows in the supplied template's order. [Official challenge and data](https://www.rsna.org/artificial-intelligence/ai-image-challenge/lumbar-spine-degenerative-classification-ai-challenge)
 
-Referansen er en historisk likt vektet femfoldsmodell med globale 2,5D-bilder. Begge modeller vurderes på de samme foldene etter den eksakte RSNA-log-loss-metrikken. Klassifikatoren og en på forhånd fastlagt 50/50-blanding må slå referansen på minst tre folder og ha et parvis bootstrap-intervall med øvre grense under null for å få erstatte den. En utforskende temperaturkalibrering rapporteres som egen analyse.
+## Historical comparison
 
-Det finnes én lokal testundersøkelse. Inferens må produsere 25 unike, endelige rader i riktig rekkefølge med sannsynligheter som summerer til én. Den undersøkelsen er et format- og integrasjonstestsett. [Offisiell utfordring og data](https://www.rsna.org/artificial-intelligence/ai-image-challenge/lumbar-spine-degenerative-classification-ai-challenge)
+The original workstation uses five historical checkpoints and their original OOF predictions. These are local inputs for the published comparison. The MRI project can also run independently with a newly trained localized reference.
 
-```powershell
-& $p -m medimage.spine_infer --root ../lumbar_spine_degenerative_classification `
-  --cache artifacts/cache/spine-test --assessment artifacts/evaluation/spine/metrics.json `
-  --localization artifacts/spine/localization --runs artifacts/spine/runs `
-  --output artifacts/inference/spine.csv
-```
+~~~powershell
+$ref = 0..4 | ForEach-Object { "D:\rsna2024_work\runs\global_resnet18_v1_fold$_\best.pt" }
+& $p -m medimage.spine_reference --root ../lumbar_spine_degenerative_classification --checkpoints @ref --trusted-legacy-format --output artifacts/baseline/global-reference.csv
+pwsh -File scripts/Run-Spine.ps1 -Python $p -Weights $weights -DataRoot ../lumbar_spine_degenerative_classification -BaselineOof 'D:\rsna2024_work\oof\global_resnet18_v1\oof_predictions.csv' -BaselineSubmission artifacts/baseline/global-reference.csv
+~~~
 
-Ved evaluering med en historisk referansemodell, bruk `--baseline-oof` i `medimage.spine_evaluate`. Hvis den valgte konfigurasjonen bruker globale sannsynligheter, oppgi dens validerte CSV med `--baseline-submission`.
+## Limitations and learning objectives
 
-`medimage.spine_reference` gjenskaper referansens inferens fra rå DICOM for fem lokale checkpoint. Referansen bruker 224 piksler, fem lineært fordelte snitt per serie, en delt ResNet-18 og gjennomsnittspooling. De historiske checkpointene ble trent fra ImageNet-initialisering over de samme foldene med AdamW og FP16.
-
-På arbeidsstasjonen kan den lokale referansen inkluderes i hele kjøringen slik. Flagget `--trusted-legacy-format` brukes for de kjente checkpointene fra det tidligere eksperimentet.
-
-```powershell
-$reference = 0..4 | ForEach-Object { "D:\rsna2024_work\runs\global_resnet18_v1_fold$_\best.pt" }
-& $p -m medimage.spine_reference --root ../lumbar_spine_degenerative_classification `
-  --checkpoints @reference --trusted-legacy-format --output artifacts/baseline/global-reference.csv
-pwsh -File scripts/Run-Spine.ps1 -Python $p -Weights $weights `
-  -DataRoot ../lumbar_spine_degenerative_classification `
-  -BaselineOof 'D:\rsna2024_work\oof\global_resnet18_v1\oof_predictions.csv' `
-  -BaselineSubmission artifacts/baseline/global-reference.csv
-```
-
-## Begrensninger og utdanningsverdi
-
-Sekvensvalg ved flere serier favoriserer dekningsområde for aksial T2 og antall snitt for de sagittale seriene. Den statistiske atlasmodellen kan feile ved uvanlig anatomi, stort avvik i orientering eller delvis bildefelt. Institusjonsuavhengig og klinisk ytelse må etableres i separate studier. Prosjektet viser hvordan fysisk bildegeometri, nestet kryssvalidering og en målspesifikk metrikk virker sammen.
+Axial selection favors coverage, while sagittal selection favors slice count. Truncated coverage, unusual anatomy, and acquisition differences affect the atlas. The project illustrates DICOM geometry, severity-aware scoring, nested validation, and how a paired comparison supports an ensemble decision. [Initial results](results.md) · [Extended search](model-search.md)

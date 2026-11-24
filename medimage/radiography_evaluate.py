@@ -61,35 +61,52 @@ def all_metrics(truth: np.ndarray, proba: np.ndarray, thresholds: np.ndarray, la
     return {'rows': len(truth), **aggregate, 'labels': per_label}
 
 
-def patient_bootstrap(truth: np.ndarray, proba: np.ndarray, groups: np.ndarray, repeats: int = 400) -> dict:
+def patient_bootstrap(truth: np.ndarray, proba: np.ndarray, groups: np.ndarray, repeats: int = 400,
+                      *, reference: np.ndarray | None = None) -> dict:
     groups, mapping = np.unique(groups, return_inverse=True)
-    sorted_labels = []
-    for y, p in zip(truth.T, proba.T, strict=True):
-        order = np.argsort(-p, kind='stable')
-        p, y = p[order], y[order]
-        cut = np.r_[np.flatnonzero(p[1:] != p[:-1]), len(p) - 1]
-        sorted_labels.append((mapping[order], y, cut))
-    rng = np.random.default_rng(1801)
-    samples = []
-    for _ in range(repeats):
-        occurrences = np.bincount(rng.integers(len(groups), size=len(groups)), minlength=len(groups))
+
+    def prepare(scores):
+        statistics = []
+        for y, p in zip(truth.T, scores.T, strict=True):
+            order = np.argsort(-p, kind='stable')
+            p, y = p[order], y[order]
+            cut = np.r_[np.flatnonzero(p[1:] != p[:-1]), len(p) - 1]
+            statistics.append((mapping[order], y, cut))
+        return statistics
+
+    def measure(sorted_labels, occurrences):
         estimate = []
         for inverse, y, cut in sorted_labels:
             row_weight = occurrences[inverse]
             tp = np.cumsum(row_weight * y)[cut]
             fp = np.cumsum(row_weight)[cut] - tp
             if tp[-1] == 0 or fp[-1] == 0:
-                break
+                return None
             recall, fpr = np.r_[0, tp / tp[-1]], np.r_[0, fp / fp[-1]]
             precision = np.divide(tp, tp + fp, out=np.zeros_like(tp), where=(tp + fp) > 0)
             estimate.append([np.trapezoid(recall, fpr), np.sum(np.diff(recall) * precision)])
-        if len(estimate) == len(sorted_labels):
-            samples.append(np.mean(estimate, axis=0))
+        return np.mean(estimate, axis=0)
+
+    sorted_labels = prepare(proba)
+    baseline = prepare(reference) if reference is not None else None
+    rng = np.random.default_rng(1801)
+    samples, deltas = [], []
+    for _ in range(repeats):
+        occurrences = np.bincount(rng.integers(len(groups), size=len(groups)), minlength=len(groups))
+        sample = measure(sorted_labels, occurrences)
+        if sample is not None:
+            samples.append(sample)
+            if baseline is not None:
+                deltas.append(sample - measure(baseline, occurrences))
     if not samples:
         raise ValueError('No evaluable patient bootstrap replicates')
     intervals = np.percentile(samples, [2.5, 97.5], axis=0).T
-    return {'valid_replicates': len(samples), 'patients': len(groups),
-            'macro_auroc_ci95': intervals[0].tolist(), 'macro_auprc_ci95': intervals[1].tolist()}
+    report = {'valid_replicates': len(samples), 'patients': len(groups),
+              'macro_auroc_ci95': intervals[0].tolist(), 'macro_auprc_ci95': intervals[1].tolist()}
+    if deltas:
+        paired = np.percentile(deltas, [2.5, 97.5], axis=0).T
+        report.update(paired_auroc_delta_ci95=paired[0].tolist(), paired_auprc_delta_ci95=paired[1].tolist())
+    return report
 
 
 def subgroups(task: str, frame) -> dict[str, np.ndarray]:

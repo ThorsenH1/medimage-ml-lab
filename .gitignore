@@ -1,10 +1,14 @@
 /artifacts/
+/search-artifacts/
+/build/
+/dist/
 __pycache__/
 .pytest_cache/
 .venv/
 *.egg-info/
 *.pt
 *.pth
+*.safetensors
 *.npy
 *.npz
 *.dcm

@@ -1,48 +1,72 @@
 # MedImage ML Lab
 
-Tre maskinlæringsprosjekter for medisinske bilder. Hvert prosjekt dekker hele arbeidsflyten fra rådata og datasplitt til GPU-trening, evaluering og lokal inferens. Utviklet for forskning og utdanning.
+Three medical-imaging machine-learning projects on a shared training engine. Each project covers dataset auditing, grouped splitting, GPU training, model selection, calibration, and inference from raw images.
 
-| Prosjekt | Oppgave | Eksperiment | Resultat |
+| Project | Scope | Selected benchmark | Project repository |
 | --- | --- | --- | --- |
-| [NIH ChestX-ray14](docs/chest.md) | 14 funnetiketter per frontalbilde | ResNet-18 med global pooling sammenlignet med etikettspesifikk oppmerksomhet | 0,779 makro-AUROC på 25 596 testbilder |
-| [CBIS-DDSM](docs/mammography.md) | Malignitetsklassifisering per bryst i et lesjonsanriket datasett | Global modell sammenlignet med oppmerksomhet over utsnitt og CC-/MLO-projeksjoner | 0,686 AUROC på 336 testbryster |
-| [RSNA LumbarDISC](docs/lumbar.md) | Tre grader for 25 kombinasjoner av funn og nivå | Nestet kryssvalidering av landemerker, DICOM-projeksjon i millimeter og 2,5D-klassifisering | 0,531 vektet log loss over fem folder, ned fra 0,647 |
+| NIH ChestX-ray14 | 14 findings on frontal radiographs | 0.7900 macro AUROC, up from 0.7787 | [Chest X-ray classification](https://github.com/ThorsenH1/chest-xray14-ml) |
+| CBIS-DDSM | Malignancy in a lesion-enriched mammography cohort | 0.7468 AUROC, up from 0.6858 | [Multi-view mammography](https://github.com/ThorsenH1/cbis-ddsm-mammography-ml) |
+| RSNA LumbarDISC | Three grades for 25 lumbar condition-level targets | 0.5260 weighted log loss, down from 0.5307 | [Lumbar MRI grading](https://github.com/ThorsenH1/rsna-lumbar-spine-ml) |
 
-[Resultater og figurer](docs/results.md) · [Kilder og metodegrunnlag](docs/research.md) · [Faglig gjennomgang](docs/study-guide.md)
+[Extended model search](docs/model-search.md) · [Initial benchmarks](docs/results.md) · [Research sources](docs/research.md) · [Study guide](docs/study-guide.md)
 
-## Lokalt oppsett
+## Shared engine
 
-Prosjektet er kjørt på Windows med Python 3.11, PyTorch 2.14.0 og CUDA 12.6 på en NVIDIA GeForce RTX 2080 SUPER med 8 GiB VRAM. Treningen bruker FP16 automatisk blandet presisjon og FP32 tapsberegning. Bildene lagres i filbaserte `uint8`-cacher som leses ved behov.
+- [Chest X-ray methods](docs/chest.md) covers multi-label classification, patient grouping, duplicate controls, and the official NIH benchmark.
+- [Mammography methods](docs/mammography.md) covers CC/MLO projections, metadata repair, and multi-instance learning.
+- [Lumbar MRI methods](docs/lumbar.md) covers DICOM geometry, nested landmark fitting, and the exact four-part RSNA metric.
 
-Med Python 3.11 tilgjengelig, kjør følgende fra rotmappen. CUDA-hjulene kommer fra PyTorch sitt eget pakkeregister. [PyTorch AMP-dokumentasjon](https://docs.pytorch.org/docs/2.14/amp.html)
+The project repositories pin this shared engine by commit. Each includes its own training entry point, aggregate performance data, figures, and prediction examples.
 
-```powershell
+## Install
+
+The experiments ran on Windows with Python 3.11, PyTorch 2.14.0, CUDA 12.6, and an NVIDIA RTX 2080 SUPER with 8 GiB VRAM. Training uses FP16 autocast, FP32 losses, and disk-backed pixel and embedding stores. [PyTorch AMP documentation](https://docs.pytorch.org/docs/2.14/amp.html)
+
+~~~powershell
 python -m venv .venv
 $p = '.\.venv\Scripts\python.exe'
-& $p -m pip install -r requirements.txt
 & $p -m pip install torch==2.14.0+cu126 torchvision==0.29.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+& $p -m pip install -e .
 & $p -m pytest -q
-```
+~~~
 
-Treningen bruker det offisielle ImageNet-1K-checkpointet for ResNet-18. Legg `resnet18-f37072fd.pth` i `hub/checkpoints` under mappen du gir som `--weights`. Treningsprogrammet verifiserer SHA-256-prefikset og bruker den lokale filen. [Torchvision ResNet-18](https://docs.pytorch.org/vision/stable/models/generated/torchvision.models.resnet18.html) · [ResNet-18-vekter](https://download.pytorch.org/models/resnet18-f37072fd.pth)
+The initial runs use the ImageNet ResNet-18 checkpoint under `hub/checkpoints/resnet18-f37072fd.pth`. The extended runs use local Hugging Face snapshots for `timm/efficientnet_b0.ra_in1k`, `timm/resnet50.a1_in1k`, `timm/vit_small_patch14_dinov2.lvd142m`, and `timm/resnet18.a1_in1k`. Preserve the standard `refs/main` and `snapshots/<revision>/model.safetensors` layout. [Torchvision weights](https://download.pytorch.org/models/resnet18-f37072fd.pth) · [DINOv2](https://arxiv.org/abs/2304.07193)
 
-Hent de tre datasettene fra kildene i prosjektbeskrivelsene. Oppgi rotmapper og vektmappe selv. Denne PC-en kan bruke Python-miljøet og de forhåndstrente ImageNet-vektene som allerede er installert.
+Source datasets, trained parameters, and individual benchmark predictions are held locally. The public projects contain code, documentation, aggregate evidence, and synthetic examples. The models are research and education prototypes.
 
-```powershell
+## Reproduce the workstation runs
+
+Use the commands below with your own data and weight paths as needed. Run GPU jobs sequentially.
+
+~~~powershell
 $p = 'D:\rsna2024_work\envs\rsna\python.exe'
 $weights = 'D:\rsna2024_work\torch-cache'
+$mammo = '../CBIS DDSM Breast Cancer Image Dataset'
+$spine = '../lumbar_spine_degenerative_classification'
 pwsh -File scripts/Run-Radiography.ps1 -Python $p -Weights $weights -Task chest -DataRoot ../chest_xray
-pwsh -File scripts/Run-Radiography.ps1 -Python $p -Weights $weights -Task mammo -DataRoot '../CBIS DDSM Breast Cancer Image Dataset'
-pwsh -File scripts/Run-Spine.ps1 -Python $p -Weights $weights -DataRoot ../lumbar_spine_degenerative_classification
-```
+pwsh -File scripts/Run-Radiography.ps1 -Python $p -Weights $weights -Task mammo -DataRoot $mammo
+pwsh -File scripts/Run-Spine.ps1 -Python $p -Weights $weights -DataRoot $spine
+~~~
 
-Kjør GPU-arbeidsflytene etter tur. Lokal `artifacts/` bør ha minst 8 GiB ledig plass til cacher, checkpoint og resultater. Samme kommando kan gjenoppta en avbrutt cache eller trening fra siste lagrede epoke. Python-modulene har `--help` for separate faser.
+For the historical MRI comparator, use the inputs listed in the [MRI methods](docs/lumbar.md). The extended search uses the first run's cohorts and local checkpoints and needs at least 20 GiB of additional disk space.
 
-## Lokal inferens og prosjektfiler
+~~~powershell
+$search = 'D:\medimage_ml_search'
+$hf = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.cache\huggingface\hub'
+New-Item -ItemType Directory -Path $search -Force | Out-Null
+& $p -m medimage.search_features pixels chest --cohort artifacts/cache/chest --root ../chest_xray --output "$search/pixels/chest"
+& $p -m medimage.search_features pixels mammo --cohort artifacts/cache/mammo-full --root $mammo --output "$search/pixels/mammo"
+pwsh -File scripts/Extract-SearchFeatures.ps1 -Python $p -WeightRoot $hf -SearchRoot $search
+pwsh -File scripts/Search-Models.ps1 -Python $p -WeightRoot $hf -SearchRoot $search -SpineData $spine
+pwsh -File scripts/Verify-Search.ps1 -Python $p -WeightRoot $hf -SearchRoot $search -ChestData ../chest_xray -MammographyData $mammo -SpineData $spine
+~~~
 
-- `medimage.radiography_predict` tar ett frontalbilde eller ett til to mammografibilder og returnerer kalibrerte forskningssannsynligheter.
-- `medimage.spine_infer` leser rå DICOM, lokaliserer fem nivåer, beregner sannsynlighetene og validerer radformatet for RSNA.
-- `artifacts/cache/` inneholder lokale kohorter og avledede bilder. Treningshistorikk, checkpoint, pasientnivåprediksjoner og evalueringsrapporter ligger også under `artifacts/`.
-- `tests/` dekker blant annet pasientseparasjon, DICOM-geometri, manglende projeksjoner, eksakt metrikksamsvar, alvorlighetsmaskering og GPU-regning.
+The search ranks heads on inner development splits, refits finalists with two seeds, and locks the winner before benchmark scoring. MRI uses a separate inner holdout inside each outer fold and checks ROI fitting provenance. The strongest new X-ray transfer profile for each task is fine-tuned directly on images. The thorax comparison also includes a higher-resolution continuation of the initial model.
 
-Repoet deler kildekode, metode og aggregerte tall. Pasientnivåfiler, datasett og modellvekter oppbevares lokalt. Modellene er forskningsprototyper uten klinisk validering.
+Caches and long runs resume from their last saved boundary. Each Python module exposes its inputs through `--help`. For prediction, retain `selection.json` and its declared checkpoint roots.
+
+~~~powershell
+& $p -m medimage.search_predict radiography --selection "$search/evaluation/chest/selection.json" --search "$search/runs/chest" --weights $hf --original artifacts --image 'C:\images\frontal.png' --output "$search/inference/new-chest.json"
+~~~
+
+For mammography, use the mammography selection and run directories and pass `--cc` and/or `--mlo` for the same breast. For MRI, use `medimage.search_predict spine` with an RSNA-format cohort and a matching first-round submission.

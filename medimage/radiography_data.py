@@ -182,7 +182,7 @@ def resize_chest(path: Path) -> np.ndarray:
     return cv2.resize(image, (CHEST_SIZE, CHEST_SIZE), interpolation=cv2.INTER_AREA)
 
 
-def prepare_breast(path: Path) -> np.ndarray:
+def prepare_breast(path: Path, output_shape: tuple[int, int] = MAMMO_SHAPE) -> np.ndarray:
     image = read_image(path, cv2.IMREAD_REDUCED_GRAYSCALE_2)
     preview = cv2.resize(image, (160, 256), interpolation=cv2.INTER_AREA)
     threshold = max(8, float(np.percentile(preview, 90)) * .12)
@@ -205,7 +205,7 @@ def prepare_breast(path: Path) -> np.ndarray:
     wing = max(1, tissue.shape[1] // 6)
     if foreground[:, -wing:].sum() > foreground[:, :wing].sum():
         tissue = tissue[:, ::-1]
-    scaled_height, scaled_width = MAMMO_SHAPE
+    scaled_height, scaled_width = output_shape
     return cv2.resize(tissue, (scaled_width, scaled_height), interpolation=cv2.INTER_AREA)
 
 

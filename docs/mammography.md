@@ -1,27 +1,21 @@
-# CBIS-DDSM mammografi
+# CBIS-DDSM mammography
 
-Oppgaven graderer malignitetsrisiko per bryst i et datasett med allerede annoterte lesjoner. Hver enhet kan ha CC-projeksjon, MLO-projeksjon eller begge. Vevsregionen segmenteres med en enkel forgrunnsmetode, og helbildet orienteres med brystveggen mot venstre. Datasettet beholder projeksjonsmasken under trening og inferens.
+The task estimates whether an annotated breast has at least one malignant lesion. It uses a CC image, an MLO image, or both. Foreground segmentation removes background and aligns the chest wall to the left. Projection masks flow through training and inference.
 
-## Eksperiment
+## Experiment
 
-Den globale referansen bruker én nedskalert representasjon per tilgjengelig projeksjon. Oppmerksomhetsvarianten ser helbildet og seks overlappende utsnitt per projeksjon. Gated attention kombinerer utsnittene, og oppmerksomhet på tvers av projeksjonene kombinerer CC og MLO. Klasseetiketten er malign når minst én av de registrerte lesjonene på brystet er malign. Hovedmodellene bruker helbilder som inngang.
+The global comparison uses one whole-image representation per available view. The multi-instance experiment uses the whole image and six overlapping crops per view. Gated attention combines patches, while cross-view interaction can combine CC and MLO. The endpoint is malignant if any recorded lesion in the breast is malignant.
 
-Pasienter deles på tvers av begge lesjonstyper. 31 pasienter med inkonsistent offisiell inndeling og 27 bryster med tvetydig kobling til mer enn ett bilde i samme projeksjon er ekskludert. For 282 radreferanser i forkalkningstestsettet ble innebygde bilde-ID-er og helbildedimensjoner brukt til å gjenopprette manglende metadata. Dette økte testsettet fra 221 til 336 bryster. Trenings- og valideringsbilder og tilhørende rader var byteidentiske gjennom rettingen.
+Patient grouping spans the mass and calcification tables. The cohort drops 31 patients with conflicting official split assignments and 27 breasts whose projections could not be linked unambiguously. For 282 calcification test rows with missing series descriptions, exact study and series UIDs and full-image dimensions support the join. Repairing the mapping increased the test cohort from 221 to 336 breasts. Training and validation rows and pixels were verified to be identical across the repair.
 
-Den endelige kohorten består av 1 039 bryster til trening, 260 til validering og 336 til test. Modellen ble valgt etter validerings-AUROC. Modellvariantene har ulike epokebudsjetter og sammenlignes som fullstendige treningsoppskrifter. Trenings- og valideringskurvene viser at overtilpasning ble tydelig etter de første epokene.
+The final cohort contains 1,039 training, 260 validation, and 336 test breasts. Model selection maximizes validation AUROC. The original recipes had different epoch budgets and showed overfitting after the first few epochs. The extended search evaluates four encoder/resolution profiles and fine-tunes the strongest new one from images.
 
-## Begrensninger og utdanningsverdi
+## Limitations and learning objectives
 
-Dataene er et retrospektivt, lesjonsanriket utvalg av digitalisert film. Utfallet, prevalensen og den tilgjengelige bildekvaliteten avgrenser hva målt ytelse betyr. Enkelte bryster har bare én projeksjon. Undergruppeanalysen viser resultatene for masse, forkalkning og projeksjonsdekning. [Datasett og dataartikkel hos TCIA](https://www.cancerimagingarchive.net/collection/cbis-ddsm/)
+This is a retrospective, lesion-enriched cohort of digitized film mammograms. The endpoint and prevalence follow that sampling scheme. The projection, mass, and calcification subgroups describe model behavior within this cohort. [TCIA collection and descriptor](https://www.cancerimagingarchive.net/collection/cbis-ddsm/)
 
-Prosjektet viser hvordan valg av målvariabel, koblingen mellom DICOM-metadata og JPEG og validering på pasientnivå kan endre et forskningsforsøk.
+The project shows how endpoint definition, DICOM-to-JPEG matching, and patient grouping change a classification experiment.
 
-## Inferens
+## Inference
 
-Bruk helbilder av samme bryst. Utelat `--cc` eller `--mlo` hvis bare én projeksjon finnes.
-
-```powershell
-& $p -m medimage.radiography_predict --checkpoint artifacts/runs/mammo-global/best.pt `
-  --calibration artifacts/evaluation/mammo/calibration.json --cc 'C:\bilder\cc.jpg' --mlo 'C:\bilder\mlo.jpg' `
-  --output artifacts/inference/mammo.json
-```
+Pass full views of the same breast through `--cc` and/or `--mlo`. Use the matching selection file and checkpoints. The [project repository](https://github.com/ThorsenH1/cbis-ddsm-mammography-ml) includes the exact command and synthetic examples. [Initial results](results.md) · [Extended search](model-search.md)
