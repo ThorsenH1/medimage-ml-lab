@@ -2,11 +2,11 @@
 
 Tre maskinlæringsprosjekter for medisinske bilder. Hvert prosjekt dekker hele arbeidsflyten fra rådata og datasplitt til GPU-trening, evaluering og lokal inferens. Utviklet for forskning og utdanning.
 
-| Prosjekt | Oppgave | Eksperiment |
-| --- | --- | --- |
-| [NIH ChestX-ray14](docs/chest.md) | 14 uavhengige funnetiketter per frontalbilde | ResNet-18 med global pooling sammenlignet med etikettspesifikk oppmerksomhet og samspill mellom etiketter |
-| [CBIS-DDSM](docs/mammography.md) | Malignitetsklassifisering per bryst i et lesjonsanriket datasett | Global modell sammenlignet med oppmerksomhet over flere utsnitt og CC-/MLO-projeksjoner |
-| [RSNA LumbarDISC](docs/lumbar.md) | Tre grader for fem tilstander ved fem nivåer i korsryggen | Nestet kryssvalidering av landemerker, DICOM-projeksjon i millimeter og 2,5D-klassifisering |
+| Prosjekt | Oppgave | Eksperiment | Resultat |
+| --- | --- | --- | --- |
+| [NIH ChestX-ray14](docs/chest.md) | 14 funnetiketter per frontalbilde | ResNet-18 med global pooling sammenlignet med etikettspesifikk oppmerksomhet | 0,779 makro-AUROC på 25 596 testbilder |
+| [CBIS-DDSM](docs/mammography.md) | Malignitetsklassifisering per bryst i et lesjonsanriket datasett | Global modell sammenlignet med oppmerksomhet over utsnitt og CC-/MLO-projeksjoner | 0,686 AUROC på 336 testbryster |
+| [RSNA LumbarDISC](docs/lumbar.md) | Tre grader for 25 kombinasjoner av funn og nivå | Nestet kryssvalidering av landemerker, DICOM-projeksjon i millimeter og 2,5D-klassifisering | 0,531 vektet log loss over fem folder, ned fra 0,647 |
 
 [Resultater og figurer](docs/results.md) · [Kilder og metodegrunnlag](docs/research.md) · [Faglig gjennomgang](docs/study-guide.md)
 

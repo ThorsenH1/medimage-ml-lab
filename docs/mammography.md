@@ -8,7 +8,7 @@ Den globale referansen bruker én nedskalert representasjon per tilgjengelig pro
 
 Pasienter deles på tvers av begge lesjonstyper. 31 pasienter med inkonsistent offisiell inndeling og 27 bryster med tvetydig kobling til mer enn ett bilde i samme projeksjon er ekskludert. For 282 radreferanser i forkalkningstestsettet ble innebygde bilde-ID-er og helbildedimensjoner brukt til å gjenopprette manglende metadata. Dette økte testsettet fra 221 til 336 bryster. Trenings- og valideringsbilder og tilhørende rader var byteidentiske gjennom rettingen.
 
-Den endelige kohorten består av 1 039 bryster til trening, 260 til validering og 336 til test. Modellen ble valgt etter validerings-AUROC. Høyere dimensjon og mer oppmerksomhet kan føre til overtilpasning, spesielt med rundt tusen treningsenheter.
+Den endelige kohorten består av 1 039 bryster til trening, 260 til validering og 336 til test. Modellen ble valgt etter validerings-AUROC. Modellvariantene har ulike epokebudsjetter og sammenlignes som fullstendige treningsoppskrifter. Trenings- og valideringskurvene viser at overtilpasning ble tydelig etter de første epokene.
 
 ## Begrensninger og utdanningsverdi
 

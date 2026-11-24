@@ -1,6 +1,6 @@
 # NIH ChestX-ray14
 
-Oppgaven gir 14 binære utganger for hvert frontale thoraxbilde. Modellen med etikettspesifikke spørringer leser lokale trekk på et 5 × 5-gitter, modellerer samspill mellom etiketter og legger stedsinformasjonen til den globale utgangen. Den globale referansen bruker samme ResNet-18-stamme og er en direkte ablasjon av oppmerksomhetsdelen.
+Oppgaven gir 14 binære utganger for hvert frontale thoraxbilde. Modellen med etikettspesifikke spørringer leser lokale trekk på et 5 × 5-gitter, modellerer samspill mellom etiketter og legger stedsinformasjonen til den globale utgangen. Den globale referansen bruker samme ResNet-18-stamme. Oppskriftene har ulike epokebudsjetter og OneCycle-planer, så resultatforskjellen gjelder de fullstendige oppskriftene.
 
 ## Kohort og validering
 
@@ -21,7 +21,7 @@ Prosjektet viser hvorfor presisjon–recall, prevalens og kalibrering må leses 
 Trenings- og evalueringsskriptet skriver `evaluation-plan.json` med det valgte modellnavnet. Bruk dette navnet i checkpointbanen.
 
 ```powershell
-& $p -m medimage.radiography_predict --checkpoint artifacts/runs/chest-attention/best.pt `
+& $p -m medimage.radiography_predict --checkpoint artifacts/runs/chest-global/best.pt `
   --calibration artifacts/evaluation/chest/calibration.json --image 'C:\bilder\frontalbilde.png' `
   --output artifacts/inference/chest.json
 ```

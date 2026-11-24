@@ -32,6 +32,18 @@ Ved evaluering med en historisk referansemodell, bruk `--baseline-oof` i `medima
 
 `medimage.spine_reference` gjenskaper referansens inferens fra rå DICOM for fem lokale checkpoint. Referansen bruker 224 piksler, fem lineært fordelte snitt per serie, en delt ResNet-18 og gjennomsnittspooling. De historiske checkpointene ble trent fra ImageNet-initialisering over de samme foldene med AdamW og FP16.
 
+På arbeidsstasjonen kan den lokale referansen inkluderes i hele kjøringen slik. Flagget `--trusted-legacy-format` brukes for de kjente checkpointene fra det tidligere eksperimentet.
+
+```powershell
+$reference = 0..4 | ForEach-Object { "D:\rsna2024_work\runs\global_resnet18_v1_fold$_\best.pt" }
+& $p -m medimage.spine_reference --root ../lumbar_spine_degenerative_classification `
+  --checkpoints @reference --trusted-legacy-format --output artifacts/baseline/global-reference.csv
+pwsh -File scripts/Run-Spine.ps1 -Python $p -Weights $weights `
+  -DataRoot ../lumbar_spine_degenerative_classification `
+  -BaselineOof 'D:\rsna2024_work\oof\global_resnet18_v1\oof_predictions.csv' `
+  -BaselineSubmission artifacts/baseline/global-reference.csv
+```
+
 ## Begrensninger og utdanningsverdi
 
 Sekvensvalg ved flere serier favoriserer dekningsområde for aksial T2 og antall snitt for de sagittale seriene. Den statistiske atlasmodellen kan feile ved uvanlig anatomi, stort avvik i orientering eller delvis bildefelt. Institusjonsuavhengig og klinisk ytelse må etableres i separate studier. Prosjektet viser hvordan fysisk bildegeometri, nestet kryssvalidering og en målspesifikk metrikk virker sammen.

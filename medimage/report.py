@@ -86,6 +86,8 @@ def report(artifacts: Path, output: Path) -> None:
                      f'{raw["macro_brier"]:.4f} → {result["macro_brier"]:.4f} |')
     lines.extend(['', 'Thorax bruker makrogjennomsnittet over 14 etiketter. Mammografi bruker én malignitetsvariabel. '
                   'Intervallene bruker 400 trekk med tilbakelegging av hele pasientgrupper. Thoraxgrupper slår sammen pasient-ID-er som deler identiske bilder.', '',
+                  'Brier-tapet måler gjennomsnittlig kvadratfeil for de predikerte sannsynlighetene. '
+                  'Sammenlign før og etter på hvert testsett for å se hvordan kalibreringen overføres fra valideringssettet.', '',
                   '### Valideringsforsøk', '',
                   '| Forsøk | Epoke | AUROC | Gjennomsnittlig presisjon | Trente epoker | Minutter | Maks reservert VRAM |',
                   '| --- | ---: | ---: | ---: | ---: | ---: | ---: |'])
@@ -131,7 +133,7 @@ def report(artifacts: Path, output: Path) -> None:
                   f'{local["missing_primary_roi_fraction"]:.2%} av primærutsnittene hadde manglende sekvens.', '',
                   f'På fold 0 var tapet {regular:.5f} med estimerte koordinater og {oracle:.5f} med tilgjengelige annoterte koordinater. '
                   f'Utforskende kalibrering på de lagrede OOF-prediksjonene ga {spine["exploratory_cross_fold_calibration"]["score"]["score"]:.5f}.', ''])
-    (output / 'results.md').write_text('\n'.join(lines), encoding='utf-8')
+    (output / 'results.md').write_text('\n'.join(lines), encoding='utf-8', newline='\n')
 
 
 def main() -> None:
