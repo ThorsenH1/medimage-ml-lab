@@ -17,6 +17,16 @@ The exact RSNA weighted log loss is the primary metric. The historical reference
 
 The local test contains one unlabeled study. The integration test checks 25 rows in the supplied template's order. [Official challenge and data](https://www.rsna.org/artificial-intelligence/ai-image-challenge/lumbar-spine-degenerative-classification-ai-challenge)
 
+## Discrimination by severity
+
+The selected model produced **0.8534 macro one-vs-rest AUROC** across 75 level, condition, and severity combinations on the held-out folds. The 95% study-bootstrap interval is 0.8472–0.8599. Moderate severity averaged 0.7937, with the lowest result at left subarticular L4–L5, where AUROC was 0.6397. The original weighted log loss is 0.5260.
+
+The scorer pools predictions across folds and removes unavailable annotations within each target. It checks the fold manifest hash and reproduces the selected model's reported log loss before scoring AUROC. The report includes per-fold and per-condition metrics, per-class positive and negative counts, and examples of correct and incorrect held-out grades.
+
+~~~powershell
+& $p -m medimage.auc_spine --root $spine --folds artifacts/spine/folds.csv --selection "$search/runs/spine/selection.json" --predictions "$search/runs/spine/selected-oof.csv" --output "$search/evaluation/spine-discrimination"
+~~~
+
 ## Historical comparison
 
 The original workstation uses five historical checkpoints and their original OOF predictions. These are local inputs for the published comparison. The MRI project can also run independently with a newly trained localized reference.
