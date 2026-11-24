@@ -5,7 +5,7 @@ Three medical-imaging machine-learning projects on a shared training engine. Eac
 | Project | Scope | Selected benchmark | Project repository |
 | --- | --- | --- | --- |
 | NIH ChestX-ray14 | 14 findings on frontal radiographs | 0.8025 macro AUROC, up from 0.7900 | [Chest X-ray classification](https://github.com/ThorsenH1/chest-xray14-ml) |
-| CBIS-DDSM | Malignancy in a lesion-enriched mammography cohort | 0.7904 AUROC, up from 0.7468 | [Multi-view mammography](https://github.com/ThorsenH1/cbis-ddsm-mammography-ml) |
+| CBIS-DDSM | Malignancy in a lesion-enriched mammography cohort | 0.8050 AUROC, up from 0.7468 | [Multi-view mammography](https://github.com/ThorsenH1/cbis-ddsm-mammography-ml) |
 | RSNA LumbarDISC | Three grades for 25 lumbar condition-level targets | 0.8534 macro AUROC and 0.5260 weighted log loss on five held-out folds | [Lumbar MRI grading](https://github.com/ThorsenH1/rsna-lumbar-spine-ml) |
 
 [Discrimination experiments](docs/auroc.md) · [Extended model search](docs/model-search.md) · [Initial benchmarks](docs/results.md) · [Research sources](docs/research.md) · [Study guide](docs/study-guide.md)
