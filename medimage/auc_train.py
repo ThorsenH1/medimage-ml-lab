@@ -90,7 +90,20 @@ def transfer(array, rows):
 def infer_batch(model, task, arrays, rows, tta):
     pixels = transfer(arrays['pixels'], rows)
     if task == 'mammo':
-        return model(pixels, transfer(arrays['views'], rows))[0]
+        views = transfer(arrays['views'], rows)
+        logits = model(pixels, views)[0].float()
+        if not tta:
+            return logits
+        source = pixels.flatten(0, 1)[:, None].float() / 255.
+        augmented = []
+        for angle, gamma in ((-.045, 1.07), (.045, .94), (0., 1.12), (0., .89)):
+            cosine, sine = np.cos(angle), np.sin(angle)
+            transform = source.new_tensor([[cosine, sine, 0.], [-sine, cosine, 0.]])
+            grid = F.affine_grid(transform[None].expand(len(source), -1, -1), source.shape, align_corners=False)
+            warped = F.grid_sample(source, grid, align_corners=False)
+            image = (warped.clamp(0, 1).pow(gamma) * 255.).reshape_as(pixels)
+            augmented.append(model(image, views)[0].float())
+        return .5 * logits + .5 * torch.stack(augmented).mean(0)
     logits = model(pixels).float()
     return (logits + model(pixels.flip(-1)).float()) * .5 if tta else logits
 

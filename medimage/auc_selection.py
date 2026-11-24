@@ -233,6 +233,10 @@ def load_component(work: Path, candidate, weights: Path, clip: Path | None):
         from medimage.auc_mammo_mil import BreastMIL
 
         model = BreastMIL(**saved['head'])
+    elif config['backbone'] == 'mammo-texture':
+        from medimage.auc_mammo_texture import TextureClassifier
+
+        model = TextureClassifier(**saved['head'])
     elif config['backbone'] == 'patch-r18':
         model = PatchNet(weights)
     else:
@@ -253,6 +257,10 @@ def component_logits(model, saved, arrays, rows, weights=None):
         from medimage.auc_mammo_mil import predict as predict_mil
 
         logits = predict_mil(model, saved, arrays, rows, weights)
+    elif config['backbone'] == 'mammo-texture':
+        from medimage.auc_mammo_texture import breast_features, predict as predict_texture
+
+        logits = predict_texture(model, breast_features(arrays, rows))
     elif config['backbone'] == 'patch-r18':
         logits = scan(model, arrays, rows)[saved['pooling']]
     else:

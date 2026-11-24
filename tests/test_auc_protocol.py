@@ -8,6 +8,7 @@ from sklearn.model_selection import GroupKFold
 
 from medimage.auc_mammo_data import Geometry
 from medimage.auc_mammo_mil import BreastMIL
+from medimage.auc_mammo_texture import TEXTURE_DIMENSIONS, breast_features
 from medimage.auc_selection import cross_fit_calibration, fit_pairwise_weights, label_weights, read_scores
 from medimage.auc_train import ResidentPixels
 from medimage.radiography_evaluate import patient_bootstrap
@@ -43,6 +44,17 @@ def test_breast_attention_ignores_unavailable_projections():
         perturbed = model(bags.masked_fill(~mask[..., None], 10.), mask)
     assert torch.isfinite(baseline).all()
     torch.testing.assert_close(baseline, perturbed)
+
+
+def test_texture_bank_marks_the_missing_view_and_responds_to_bright_spots():
+    initial = np.full((96, 64), 65, dtype=np.uint8)
+    study = {'pixels': np.stack([initial, initial])[None], 'views': np.array([[True, False]])}
+    before = breast_features(study, [0], workers=1)
+    study['pixels'][0, 0, 19:21, 22:24] = 245
+    after = breast_features(study, [0], workers=1)
+    assert before.shape == after.shape == (1, TEXTURE_DIMENSIONS * 3 + 2)
+    np.testing.assert_array_equal(after[0, -2:], [1., 0.])
+    assert not np.array_equal(before[0, :TEXTURE_DIMENSIONS], after[0, :TEXTURE_DIMENSIONS])
 
 
 def test_mammography_mask_uses_the_same_crop_flip_and_canvas():
