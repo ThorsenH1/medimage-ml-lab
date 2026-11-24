@@ -15,9 +15,15 @@ from medimage.spine_localize import SpineCache
 from medimage.spine_model import crop_regions
 
 
-def render_case(cache, case_index, regions, probabilities, output, annotated=False) -> None:
+def render_case(cache, case_index, regions, probabilities, output, annotated=False, reference_grades=None) -> None:
     if regions.shape != (25, 3, 5):
         raise ValueError('Expected one three-slice window per graded disc-level target')
+    grade_names = ('Normal / mild', 'Moderate', 'Severe')
+    if reference_grades is not None:
+        reference_grades = np.asarray(reference_grades)
+        if reference_grades.shape != (5,) or not np.isin(reference_grades, [-1, 0, 1, 2]).all():
+            raise ValueError('Expected five reference grades in lumbar disc order')
+        reference_grades = reference_grades.astype(np.int64, copy=False)
     packed = np.full((30, 3, 5), -1, dtype=np.float32)
     packed[:25] = regions
     crops = crop_regions(cache.volumes[case_index], packed)
@@ -87,6 +93,8 @@ def render_case(cache, case_index, regions, probabilities, output, annotated=Fal
         ax.set_yticks([])
         ax.set_xticks([] if row < 4 else [.0, .25, .5, .75, 1.])
         ax.spines[['top', 'left', 'right']].set_visible(False)
+        if reference_grades is not None and reference_grades[row] >= 0:
+            ax.text(.012, -.49, f'Dataset grade: {grade_names[reference_grades[row]]}', va='center', fontsize=8)
         if row == 0:
             ax.set_title('Three model scores at each level', loc='left', fontsize=11)
     axes[-1].set_xlabel('Normal / mild (blue)     Moderate (gold)     Severe (teal)', fontsize=9)
