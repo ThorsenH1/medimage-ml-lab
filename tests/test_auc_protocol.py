@@ -9,7 +9,7 @@ from sklearn.model_selection import GroupKFold
 from medimage.auc_mammo_data import Geometry
 from medimage.auc_mammo_mil import BreastMIL
 from medimage.auc_mammo_texture import TEXTURE_DIMENSIONS, breast_features
-from medimage.auc_selection import cross_fit_calibration, fit_pairwise_weights, label_weights, read_scores
+from medimage.auc_selection import cross_fit_calibration, fit_pairwise_weights, label_weights, read_scores, stable_candidate
 from medimage.auc_train import ResidentPixels
 from medimage.radiography_evaluate import patient_bootstrap
 
@@ -30,6 +30,16 @@ def test_pairwise_fusion_prefers_the_better_ranker_on_its_fit_rows():
     assert weights[0] > weights[1]
     assert np.all(weights >= 0)
     np.testing.assert_allclose(weights.sum(), 1.)
+
+
+def test_group_bagging_produces_normalized_model_weights():
+    labels = np.tile([[0], [1]], (20, 1))
+    rng = np.random.default_rng(602)
+    scores = {name: labels + rng.normal(0, .45, labels.shape) for name in ('a', 'b', 'c')}
+    candidate = stable_candidate(labels, scores, np.arange(len(labels)), {key: key for key in scores})
+    assert candidate['selection_folds'] == 15
+    assert candidate['metrics']['macro_auroc'] > .7
+    np.testing.assert_allclose(sum(candidate['weights'].values()), 1.)
 
 
 def test_breast_attention_ignores_unavailable_projections():

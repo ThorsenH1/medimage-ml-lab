@@ -8,7 +8,7 @@ import numpy as np
 from scipy.optimize import minimize
 from scipy.special import expit
 from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import GroupKFold, StratifiedGroupKFold
 from threadpoolctl import threadpool_limits
 
 from medimage.common import checksum, load_manifest, read_json, write_json
@@ -130,6 +130,46 @@ def pairwise_candidate(truth, scores, folds, strength):
             'metrics': validation_metrics(truth, out)}
 
 
+def stable_candidate(truth, scores, groups, families):
+    if len(set(families.values())) < 2:
+        raise ValueError('Stable blending requires at least two model families')
+    predicted = np.zeros_like(truth, dtype=np.float64)
+    collected = {key: 0. for key in scores}
+    seeds = (421, 510, 719)
+    for seed in seeds:
+        splitter = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=seed)
+        for fit, check in splitter.split(truth, truth[:, 0], groups):
+            ranked = sorted(scores, key=lambda key: roc_auc_score(truth[fit, 0], scores[key][fit, 0]),
+                            reverse=True)
+            unique = {}
+            for key in ranked:
+                unique.setdefault(families[key], key)
+            names = list(unique.values())[:6]
+            projections = {}
+            for key in names:
+                calibration, _ = fit_calibration(truth[fit], scores[key][fit])
+                slope, intercept = calibration[0]
+                projections[key] = scores[key] * slope + intercept
+            fits = []
+            for size in (2, 3):
+                for subset in combinations(names, size):
+                    logits = np.mean([projections[key][fit] for key in subset], axis=0)
+                    fits.append((roc_auc_score(truth[fit, 0], logits[:, 0]), subset))
+            fits.sort(key=lambda item: item[0], reverse=True)
+            retained = fits[:4]
+            values = np.asarray([score for score, _ in retained])
+            strength = np.exp((values - values[0]) / .01)
+            strength /= strength.sum()
+            for fraction, (_, subset) in zip(strength, retained, strict=True):
+                contribution = float(fraction) / (len(seeds) * len(subset))
+                for key in subset:
+                    predicted[check] += contribution * projections[key][check]
+                    collected[key] += contribution / splitter.n_splits
+    return {'weights': {key: fraction for key, fraction in collected.items() if fraction > 0},
+            'method': 'calibrated-validation-bag', 'selection_folds': len(seeds) * 5,
+            'metrics': validation_metrics(truth, predicted)}
+
+
 def validation_lock(args):
     frame, audit = load_manifest(args.cohort)
     rows = np.flatnonzero(frame.split.eq('val').to_numpy())
@@ -184,12 +224,24 @@ def validation_lock(args):
         if args.task != 'mammo':
             raise ValueError('Pairwise ranking blend is implemented for the breast-level endpoint')
         candidates.extend(pairwise_candidate(truth, scores, folds, strength) for strength in (.03, .12, .4))
+    if args.stable_blend:
+        if args.task != 'mammo':
+            raise ValueError('Validation bagging is implemented for the breast-level endpoint')
+        families = {key: entry.get('config', {}).get('original_sha256', entry.get('checkpoint_sha256', key))
+                    for key, entry in metadata.items()}
+        candidates.append(stable_candidate(truth, scores, identities, families))
     candidates.sort(key=lambda item: (item['metrics']['macro_auroc'], item['metrics']['macro_auprc']),
                     reverse=True)
-    selected = candidates[0]
+    eligible = ([item for item in candidates
+                 if item['method'] in ('calibrated-pairwise-logit', 'calibrated-validation-bag')]
+                if args.crossfit_only else candidates)
+    if not eligible:
+        raise ValueError('Cross-fit-only selection requires a nested blend candidate')
+    selected = eligible[0]
     selected_logits = selected_scores(lock_selected=selected, scores=scores, calibration=parameters)
     calibration, thresholds = fit_calibration(truth, selected_logits)
-    lock = {'task': args.task, 'manifest': audit['manifest_sha256'], 'criterion': 'validation macro AUROC, AP tie-breaker',
+    criterion = ('nested group validation macro AUROC' if args.crossfit_only else 'validation macro AUROC')
+    lock = {'task': args.task, 'manifest': audit['manifest_sha256'], 'criterion': f'{criterion}, AP tie-breaker',
             'blend_validation_calibration': 'Five group-disjoint folds inside validation',
             'validation_rows': len(rows), 'labels': list(labels), 'candidates': metadata,
             'validation_ranking': candidates, 'selected': selected, 'component_calibration': parameters,
@@ -383,6 +435,8 @@ def main():
     parser.add_argument('--weights', type=Path)
     parser.add_argument('--clip', type=Path)
     parser.add_argument('--pairwise', action='store_true', help='Compare convex pairwise-ranking blends on validation')
+    parser.add_argument('--stable-blend', action='store_true', help='Compare group-fold aggregation of small blends')
+    parser.add_argument('--crossfit-only', action='store_true', help='Select among nested group cross-fit blend candidates')
     parser.add_argument('--bootstrap', type=int, default=1000)
     args = parser.parse_args()
     if args.phase == 'lock':

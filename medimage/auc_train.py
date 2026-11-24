@@ -42,7 +42,7 @@ def new_model(config: dict, weights: Path, *, initialize: bool = False):
         return ChestDense(config['backbone'], config['depth'], weights if initialize else None)
     return MammographySpatial(config['backbone'], config['resolution'], weights,
                               config['depth'], config['dropout'], config.get('pyramid', False),
-                              initialize, config.get('specialize', False))
+                              initialize, config.get('specialize', False), config.get('view_supervision', False))
 
 
 class ResidentPixels:
@@ -139,7 +139,7 @@ def fit(args) -> None:
         'lr', 'head_lr', 'class_power', 'auxiliary', 'dropout', 'tta', 'focal_neg')}
     config.update(manifest=audit['manifest_sha256'], pixel_sha256=pixel_hash,
                   parent_sha256=checksum(args.parent) if args.parent else None)
-    for option in ('pyramid', 'affine', 'block', 'specialize'):
+    for option in ('pyramid', 'affine', 'block', 'specialize', 'view_supervision'):
         if getattr(args, option):
             config[option] = getattr(args, option)
     model = new_model(config, args.weights, initialize=args.parent is None).cuda()
@@ -156,12 +156,15 @@ def fit(args) -> None:
             'task', 'backbone', 'manifest', 'weight_sha256')
         if any(config[key] != starter['config'].get(key) for key in fixed):
             raise ValueError('Warm start differs from the expected architecture, cohort or foundation')
-        introducing_experts = args.specialize and not starter['config'].get('specialize')
-        if introducing_experts:
+        expected_missing = set()
+        if args.specialize and not starter['config'].get('specialize'):
+            expected_missing.update({'router.weight', 'router.bias', 'offset.weight', 'offset.bias'})
+        if args.view_supervision and not starter['config'].get('view_supervision'):
+            expected_missing.update({'projection_head.weight', 'projection_head.bias'})
+        if expected_missing:
             transfer_state = model.load_state_dict(starter['model'], strict=False)
-            expert_parameters = {'router.weight', 'router.bias', 'offset.weight', 'offset.bias'}
-            if set(transfer_state.missing_keys) != expert_parameters or transfer_state.unexpected_keys:
-                raise ValueError('Warm-start weights differ beyond the new specialist heads')
+            if set(transfer_state.missing_keys) != expected_missing or transfer_state.unexpected_keys:
+                raise ValueError('Warm-start weights differ beyond the new auxiliary heads')
         else:
             model.load_state_dict(starter['model'])
     params = [p for name, p in model.named_parameters() if name.startswith('encoder.') and p.requires_grad]
@@ -214,11 +217,16 @@ def fit(args) -> None:
             with torch.autocast('cuda', dtype=torch.float16):
                 if args.task == 'mammo':
                     heatmaps = transfer(arrays['heatmaps'], rows)
+                    annotated = transfer(arrays['annotation_available'], rows)
+                    if args.view_supervision:
+                        view_label = heatmaps[:, :, [1, 3]].any(dim=(2, 3, 4)).float()
                     if args.affine:
                         pixels, heatmaps = align_augmentation(pixels, heatmaps)
                     score, spatial, *specialist = model(pixels, transfer(arrays['views'], rows))
-                    lesion_loss = spatial_loss(spatial, heatmaps,
-                                               transfer(arrays['annotation_available'], rows))
+                    lesion_loss = spatial_loss(spatial, heatmaps, annotated)
+                    if args.view_supervision:
+                        loss_by_view = F.binary_cross_entropy_with_logits(specialist[0], view_label, reduction='none')
+                        lesion_loss = lesion_loss + (loss_by_view * annotated).sum() / annotated.sum().clamp_min(1)
                     if args.specialize:
                         routing, experts = specialist
                         subtype = training_type[rows]
@@ -271,7 +279,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description='Train high-resolution models on the locked radiography cohorts')
     parser.add_argument('task', choices=('chest', 'mammo'))
     parser.add_argument('--backbone', required=True,
-                        choices=('chex', 'imagenet', 'chest-reference', 'effb0', 'effb3', 'r18', 'r50', 'mammo-clip'))
+                        choices=('chex', 'imagenet', 'chest-reference', 'effb0', 'effb3', 'r18', 'r50',
+                                 'mammo-clip', 'mammo-clip-rsna'))
     for name in ('cohort', 'pixels', 'weights', 'output'):
         parser.add_argument(f'--{name}', type=Path, required=True)
     parser.add_argument('--parent', type=Path)
@@ -293,6 +302,7 @@ def main() -> None:
     parser.add_argument('--affine', action='store_true', help='Apply aligned affine transforms to image and label')
     parser.add_argument('--pyramid', action='store_true', help='Fuse stride-8, -16, and -32 mammography features')
     parser.add_argument('--specialize', action='store_true', help='Learn mass and calcification specialists and a pixel-based router')
+    parser.add_argument('--view-supervision', action='store_true', help='Learn an auxiliary score for each annotated training projection')
     args = parser.parse_args()
     if min(args.batch, args.epochs, args.accumulate, args.depth) < 1 or args.focal_neg < 0:
         parser.error('Invalid training size or focal exponent')
@@ -302,8 +312,10 @@ def main() -> None:
         parser.error('Provide a trained chest reference checkpoint with --parent')
     if args.resident and args.block:
         parser.error('Use either resident development pixels or block shuffling')
-    if (args.affine or args.pyramid or args.specialize) and args.task != 'mammo':
+    if (args.affine or args.pyramid or args.specialize or args.view_supervision) and args.task != 'mammo':
         parser.error('Affine targets and feature pyramids require mammography')
+    if args.specialize and args.view_supervision:
+        parser.error('Choose either subtype specialists or projection supervision for this trial')
     fit(args)
 
 

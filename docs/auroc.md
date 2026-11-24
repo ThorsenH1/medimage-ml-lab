@@ -34,6 +34,10 @@ The texture experiment uses intensity distributions, spatial differences and clu
 
 For two trained spatial models, validation also compares a fixed test-time augmentation policy. The policy averages the original logit with a mean across four deterministic, mild rotation and intensity transformations. Reapplying the selected policy requires the same whole-view pixels and projection availability.
 
+A downstream transfer experiment initializes the B5 image tower from the authors' separately fine-tuned RSNA breast-cancer model. It discards the source head and fits the CBIS-DDSM breast head and spatial objective on development patients. Another branch derives per-projection malignancy supervision from the complete training masks and blends a learned projection score with the breast-level score. [Author classification script](https://github.com/batmanlab/Mammo-CLIP/blob/main/src/scripts/classifier_fine_tune_b5.sh) · [Released downstream checkpoints](https://huggingface.co/shawn24/Mammo-CLIP/tree/main/Downstream-checkpoints)
+
+Nested blend comparison aggregates the highest-scoring small combinations across three seeded repeats of five patient-grouped folds. Each held-out validation prediction uses candidates chosen and calibrated on the other validation folds. The alternative convex method fits the positive–negative ranking objective on the same separated fit rows. A test run can lock the winner among these nested policies using their held-out AUROC.
+
 ## Reports and prediction
 
 The local evaluation report includes ROC, precision–recall, subgroup summaries, paired patient-bootstrap intervals and examples with held-out reference labels. Public portfolio reports use aggregate benchmarks and synthetic input examples.

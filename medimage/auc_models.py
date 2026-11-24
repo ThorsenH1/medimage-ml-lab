@@ -8,6 +8,7 @@ from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import timm
 import torch
 import torch.nn.functional as F
@@ -24,6 +25,7 @@ from medimage.search_features import Encoder
 CHEX_HASH = '1a914ae802170187a4852e594708206c12468eeeefd66aa4e8e26141649d61a4'
 DENSE_HASH = 'a639ec97d7c33b07ae66f0b5fb7d0192f95a3b11b7576c66c0126c2a727c4395'
 MAMMO_CLIP_HASH = '0baccb0cc19cd6093ff8252f7c2b7a6efbc32973498640abcb311210c46fd02c'
+MAMMO_RSNA_HASH = '743bfaef035b5997c0d70bd7964edc3f29d5a3a099ff96a4386539a426b71727'
 EFFICIENTNET_B3_HASH = '279d2a53898aa89dab43fd6bd7df9f706aea4cb9cf916223988bbcb8e5850469'
 
 
@@ -70,13 +72,21 @@ def plain_metadata(*_):
     return {}
 
 
-def mammo_clip(weights: Path) -> nn.Module:
-    if checksum(weights) != MAMMO_CLIP_HASH:
+def mammo_clip(weights: Path, expected_sha256: str) -> nn.Module:
+    if checksum(weights) != expected_sha256:
         raise ValueError('Mammo-CLIP checkpoint differs from the documented source')
-    metadata_classes = ('omegaconf.listconfig.ListConfig', 'omegaconf.dictconfig.DictConfig',
-                        'omegaconf.nodes.AnyNode', 'omegaconf.base.ContainerMetadata', 'omegaconf.base.Metadata')
-    allowed = [(UnusedConfiguration, name) for name in metadata_classes]
-    allowed += [typing.Any, list, dict, int, (plain_metadata, 'collections.defaultdict')]
+    if expected_sha256 == MAMMO_RSNA_HASH:
+        # The verified downstream file also stores evaluation arrays. Only the
+        # image tower is used, and the checkpoint stays outside the project repos.
+        allowed = [(np._core.multiarray._reconstruct, 'numpy.core.multiarray._reconstruct'),
+                   (np._core.multiarray.scalar, 'numpy.core.multiarray.scalar'),
+                   np.ndarray, np.dtype, np.dtypes.Float32DType, np.dtypes.Float64DType,
+                   np.dtypes.Int32DType, np.dtypes.Int64DType]
+    else:
+        metadata_classes = ('omegaconf.listconfig.ListConfig', 'omegaconf.dictconfig.DictConfig',
+                            'omegaconf.nodes.AnyNode', 'omegaconf.base.ContainerMetadata', 'omegaconf.base.Metadata')
+        allowed = [(UnusedConfiguration, name) for name in metadata_classes]
+        allowed += [typing.Any, list, dict, int, (plain_metadata, 'collections.defaultdict')]
     with torch.serialization.safe_globals(allowed):
         saved = torch.load(weights, map_location='cpu', weights_only=True, mmap=True)
     source = {name.removeprefix('image_encoder.'): value for name, value in saved['model'].items()
@@ -161,12 +171,13 @@ class ChestReference(ChestClassifier):
 
 class MammographySpatial(nn.Module):
     def __init__(self, backbone: str, resolution: int, weights: Path, depth: int, dropout: float,
-                 pyramid: bool = False, initialize: bool = True, specialize: bool = False) -> None:
+                 pyramid: bool = False, initialize: bool = True, specialize: bool = False,
+                 view_supervision: bool = False) -> None:
         super().__init__()
-        if backbone == 'mammo-clip':
-            self.encoder = (mammo_clip(weights) if initialize else
+        if backbone in ('mammo-clip', 'mammo-clip-rsna'):
+            self.weight_sha256 = MAMMO_RSNA_HASH if backbone == 'mammo-clip-rsna' else MAMMO_CLIP_HASH
+            self.encoder = (mammo_clip(weights, self.weight_sha256) if initialize else
                             timm.create_model('tf_efficientnet_b5', pretrained=False, num_classes=0))
-            self.weight_sha256 = MAMMO_CLIP_HASH
             mean = torch.full((1, 1, 1, 1), .3089279)
             std = torch.full((1, 1, 1, 1), .250535554)
             self.rgb = True
@@ -192,7 +203,7 @@ class MammographySpatial(nn.Module):
         self.register_buffer('mean', mean, persistent=False)
         self.register_buffer('std', std, persistent=False)
         self.encoder.requires_grad_(False)
-        if backbone in ('effb0', 'effb3', 'mammo-clip'):
+        if backbone in ('effb0', 'effb3', 'mammo-clip', 'mammo-clip-rsna'):
             layers = [*self.encoder.blocks[-depth:], self.encoder.conv_head, self.encoder.bn2]
         elif backbone in ('r18', 'r50'):
             layers = [self.encoder.layer4] if depth == 1 else [self.encoder.layer3, self.encoder.layer4]
@@ -214,6 +225,9 @@ class MammographySpatial(nn.Module):
         self.token_score = nn.Linear(128, 1)
         self.head = nn.Sequential(nn.LayerNorm(256), nn.Dropout(dropout), nn.Linear(256, 1))
         self.specialize = specialize
+        self.view_supervision = view_supervision
+        if view_supervision:
+            self.projection_head = nn.Linear(128, 1)
         if specialize:
             self.router = nn.Linear(256, 2)
             self.offset = nn.Linear(256, 2)
@@ -268,6 +282,10 @@ class MammographySpatial(nn.Module):
         embedding = torch.cat((fused, maximum), dim=-1)
         logits = self.head(embedding)
         lesion = lesion.reshape(batch, views, 4, *lesion.shape[-2:])
+        if self.view_supervision:
+            per_view = self.projection_head(token).squeeze(-1).float()
+            pooled_view_logit = (per_view * observed).sum(1, keepdim=True) / observed.sum(1, keepdim=True)
+            return .75 * logits.float() + .25 * pooled_view_logit, lesion, per_view
         if not self.specialize:
             return logits, lesion
         routing = self.router(embedding).float()
