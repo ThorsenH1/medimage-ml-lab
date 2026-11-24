@@ -8,6 +8,16 @@ from sklearn.model_selection import GroupKFold
 from medimage.auc_mammo_data import Geometry
 from medimage.auc_selection import cross_fit_calibration, label_weights, read_scores
 from medimage.auc_train import ResidentPixels
+from medimage.radiography_evaluate import patient_bootstrap
+
+
+def test_patient_bootstrap_accepts_integer_benchmark_labels():
+    labels = np.array([[0], [1], [0], [1]], dtype=np.int8)
+    scores = np.array([[.1], [.8], [.2], [.5]])
+    baseline = np.array([[.2], [.7], [.3], [.4]])
+    result = patient_bootstrap(labels, scores, np.arange(4), repeats=40, reference=baseline)
+    assert result['macro_auroc_ci95'] == [1., 1.]
+    assert result['paired_auroc_delta_ci95'] == [0., 0.]
 
 
 def test_mammography_mask_uses_the_same_crop_flip_and_canvas():

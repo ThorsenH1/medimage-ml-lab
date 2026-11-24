@@ -92,7 +92,7 @@ def patient_bootstrap(truth: np.ndarray, proba: np.ndarray, groups: np.ndarray, 
             if tp[-1] == 0 or fp[-1] == 0:
                 return None
             recall, fpr = np.r_[0, tp / tp[-1]], np.r_[0, fp / fp[-1]]
-            precision = np.divide(tp, tp + fp, out=np.zeros_like(tp), where=(tp + fp) > 0)
+            precision = np.divide(tp, tp + fp, out=np.zeros_like(tp, dtype=float), where=(tp + fp) > 0)
             estimate.append([np.trapezoid(recall, fpr), np.sum(np.diff(recall) * precision)])
         return np.mean(estimate, axis=0)
 
