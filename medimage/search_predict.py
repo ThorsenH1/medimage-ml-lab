@@ -149,6 +149,7 @@ def spine(args: argparse.Namespace) -> None:
     np.testing.assert_allclose(reloaded, probabilities_out, atol=1e-9)
     write_json(args.output.with_suffix('.json'), {'rows': len(result), 'studies': len(cache.studies),
                                                   'selected': selected['name'], 'selection_sha256': checksum(args.selection),
+                                                  'prediction_sha256': checksum(args.output),
                                                   'checkpoint_folds': len(decision['folds'])})
     if args.trace:
         write_json(args.trace, {'task': 'spine', 'selection_sha256': checksum(args.selection),

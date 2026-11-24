@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import cv2
@@ -9,9 +10,12 @@ from sklearn.model_selection import GroupKFold
 from medimage.auc_mammo_data import Geometry
 from medimage.auc_mammo_mil import BreastMIL
 from medimage.auc_mammo_texture import TEXTURE_DIMENSIONS, breast_features
+from medimage.auc_predict import prediction_trace
 from medimage.auc_selection import cross_fit_calibration, fit_pairwise_weights, label_weights, read_scores, stable_candidate
 from medimage.auc_train import ResidentPixels
 from medimage.radiography_evaluate import patient_bootstrap
+from medimage.spine_native import reproject_regions
+from medimage.visual_explain import patch_grid, soften
 
 
 def test_patient_bootstrap_accepts_integer_benchmark_labels():
@@ -42,8 +46,9 @@ def test_group_bagging_produces_normalized_model_weights():
     np.testing.assert_allclose(sum(candidate['weights'].values()), 1.)
 
 
-def test_breast_attention_ignores_unavailable_projections():
-    model = BreastMIL(24, .2).eval()
+@pytest.mark.parametrize('contextual', [False, True])
+def test_breast_attention_ignores_unavailable_projections(contextual):
+    model = BreastMIL(24, .2, contextual=contextual).eval()
     rng = torch.Generator().manual_seed(64)
     bags = torch.randn(2, 2, 13, 520, generator=rng)
     mask = torch.zeros(2, 2, 13, dtype=torch.bool)
@@ -54,6 +59,44 @@ def test_breast_attention_ignores_unavailable_projections():
         perturbed = model(bags.masked_fill(~mask[..., None], 10.), mask)
     assert torch.isfinite(baseline).all()
     torch.testing.assert_close(baseline, perturbed)
+
+
+def test_prediction_trace_respects_per_finding_weights_and_calibration():
+    lock = {'task': 'chest', 'labels': ['first', 'second'],
+            'candidates': {'a': {'image_shape': [48, 48]}, 'b': {}},
+            'selected': {'method': 'calibrated-label-logit', 'weights': {'a': .5, 'b': .5},
+                         'label_weights': {'a': [.25, .9], 'b': [.75, .1]}},
+            'component_calibration': {'a': [[2, .5], [1, -.5]], 'b': [[1, 0], [.5, 0]]},
+            'ensemble_calibration': [[1, 0], [1, 0]], 'thresholds': [.3, .6]}
+    logits = {'a': np.array([[1., 2.]]), 'b': np.array([[0., -2.]])}
+    trace = prediction_trace(lock, logits, np.array([.65, .78]), ['frontal'], 'hash')
+    np.testing.assert_allclose(trace['components']['a']['weighted_logit'], [.625, 1.35])
+    np.testing.assert_allclose(trace['components']['b']['weighted_logit'], [0., -.1])
+    np.testing.assert_allclose(trace['fused_logit'], [.625, 1.25])
+
+
+def test_blur_probe_changes_only_its_reported_window():
+    image = np.full((96, 100), 80, dtype=np.uint8)
+    image[46:51, 48:53] = 230
+    boxes = patch_grid(image, 'chest')
+    # Coordinates also appear verbatim in public JSON.
+    json.dumps(boxes)
+    box = next((x0, y0, x1, y1) for x0, y0, x1, y1 in boxes if x0 <= 49 < x1 and y0 <= 48 < y1)
+    changed = soften(image, [box])[0]
+    x0, y0, x1, y1 = box
+    allowed = np.zeros(image.shape, dtype=bool)
+    allowed[y0:y1, x0:x1] = True
+    assert (image[allowed] != changed[allowed]).any()
+    np.testing.assert_array_equal(image[~allowed], changed[~allowed])
+
+
+def test_spine_grid_lift_preserves_physical_crop():
+    source = np.array([[[[1., 2., 0.], [2., 0., 0.], [0., 3., 0.]]]])
+    dest = np.array([[[[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]]]])
+    region = np.array([[[[0., 4., 5., 8., 12.], [-1., 0., 0., 0., 0.]]]])
+    lifted = reproject_regions(region, source, dest)
+    np.testing.assert_allclose(lifted[0, 0, 0], [0., 9., 17., 16., 36.])
+    np.testing.assert_array_equal(lifted[0, 0, 1], region[0, 0, 1])
 
 
 def test_texture_bank_marks_the_missing_view_and_responds_to_bright_spots():

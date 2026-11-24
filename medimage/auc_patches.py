@@ -17,15 +17,17 @@ from medimage.search_features import Encoder
 
 PATCH = 128
 SCALES = ((144, 72), (256, 112))
+FINE_TEXTURE_SCALES = ((96, 72), (176, 112), (288, 144))
 POOLING = ('peak', 'top3', 'top8', 'type_balanced')
 
 
 class PatchNet(nn.Module):
-    def __init__(self, weights: Path):
+    def __init__(self, weights: Path, fine_texture: bool = False):
         super().__init__()
         foundation = Encoder('r18', PATCH, weights)
         self.encoder = foundation.model
         self.weight_sha256 = foundation.weight_sha256
+        self.fine_texture = fine_texture
         self.register_buffer('mean', foundation.mean, persistent=False)
         self.register_buffer('std', foundation.std, persistent=False)
         self.head = nn.Sequential(nn.LayerNorm(512), nn.Dropout(.2), nn.Linear(512, 5))
@@ -43,6 +45,10 @@ class PatchNet(nn.Module):
             x = (x * torch.empty(shape, device=x.device).uniform_(.8, 1.22)).clamp_(0, 1)
             x = torch.where(torch.rand(shape, device=x.device) < .5, x.flip(-1), x)
             x = torch.where(torch.rand(shape, device=x.device) < .5, x.flip(-2), x)
+        if self.fine_texture:
+            fine = x - F.avg_pool2d(x, 5, stride=1, padding=2, count_include_pad=False)
+            broad = x - F.avg_pool2d(x, 15, stride=1, padding=7, count_include_pad=False)
+            x = torch.cat((x, (x + fine).clamp_(0, 1), (x + .65 * broad).clamp_(0, 1)), dim=1)
         normalized = ((x - self.mean) / self.std).contiguous(memory_format=torch.channels_last)
         features = self.encoder.forward_features(normalized)
         return features.mean((-1, -2))
@@ -58,7 +64,7 @@ def crop(image, y, x, width):
     return cv2.resize(image[y:y + width, x:x + width], (PATCH, PATCH), interpolation=cv2.INTER_AREA)
 
 
-def training_patches(pixels, boxes, complete, rows, seed: int, repeats: int):
+def training_patches(pixels, boxes, complete, rows, seed: int, repeats: int, fine_texture: bool = False):
     rng = np.random.default_rng(seed)
     patches, labels = [], []
     for row in rows:
@@ -69,8 +75,10 @@ def training_patches(pixels, boxes, complete, rows, seed: int, repeats: int):
             image = pixels[row, view]
             h, w = image.shape
             for category, x1, y1, x2, y2 in lesions:
-                for base in rng.choice([144, 192, 256, 320], size=repeats):
-                    side = int(np.clip(max(base, 1.1 * (max(x2 - x1, y2 - y1) + 1)), 128, 416))
+                scale = ([80, 112, 160, 208] if category >= 2 else [144, 192, 240, 320]) if fine_texture else (
+                    [144, 192, 256, 320])
+                for base in rng.choice(scale, size=repeats):
+                    side = int(np.clip(max(base, 1.1 * (max(x2 - x1, y2 - y1) + 1)), 80 if fine_texture else 128, 416))
                     dx, dy = rng.integers(-side // 6, side // 6 + 1, size=2)
                     patches.append(crop(image, (y1 + y2) // 2 + dy, (x1 + x2) // 2 + dx, side))
                     labels.append(int(category) + 1)
@@ -79,7 +87,7 @@ def training_patches(pixels, boxes, complete, rows, seed: int, repeats: int):
             left, top, right, bottom = lesions[:, 1:].T
             accepted = 0
             for _ in range(28):
-                side = int(rng.choice([144, 192, 256, 320]))
+                side = int(rng.choice([80, 112, 144, 208, 256, 320] if fine_texture else [144, 192, 256, 320]))
                 radius = side // 2
                 y, x = int(rng.integers(radius, h - radius)), int(rng.integers(radius, w - radius))
                 if np.any((x + radius >= left) & (x - radius <= right)
@@ -101,7 +109,7 @@ def training_patches(pixels, boxes, complete, rows, seed: int, repeats: int):
 def train_patch_epoch(model, arrays, boxes, train, seed, repeats, batch, optimizer, scaler):
     torch.manual_seed(seed)
     data, truth = training_patches(arrays['pixels'], boxes, arrays['annotation_available'],
-                                   train, seed, repeats)
+                                   train, seed, repeats, model.fine_texture)
     order = np.random.default_rng(seed + 1000).permutation(len(truth))
     frequencies = np.bincount(truth, minlength=5) / len(truth)
     balance = torch.tensor((frequencies.mean() / frequencies) ** .45, device='cuda', dtype=torch.float32)

@@ -15,18 +15,19 @@ from medimage.common import checksum, read_json, seed_everything, write_json
 from medimage.radiography_train import save_checkpoint
 from medimage.spine_localize import SpineCache, read_folds
 from medimage.spine_metrics import check_probabilities, read_targets, score, submission
-from medimage.spine_model import SpineClassifier, crop_regions, severity_loss
+from medimage.spine_model import ROI_SIZE, SpineClassifier, crop_regions, severity_loss
 
 
 class RegionDataset(Dataset):
     def __init__(self, cache: SpineCache, indices: np.ndarray, region: np.ndarray,
-                 metadata: np.ndarray, labels: np.ndarray, augment: bool = False) -> None:
+                 metadata: np.ndarray, labels: np.ndarray, augment: bool = False, resolution: int = ROI_SIZE) -> None:
         self.path = cache.path / 'volume.npy'
         self.indices = indices
         self.region = region
         self.metadata = metadata
         self.labels = labels
         self.augment = augment
+        self.resolution = resolution
         self.volumes = None
 
     def __len__(self) -> int:
@@ -38,7 +39,7 @@ class RegionDataset(Dataset):
             self.volumes = np.load(self.path, mmap_mode='r', allow_pickle=False)
         row = self.indices[index]
         offset = np.random.uniform(-.07, .07, size=(30, 2)) if self.augment else None
-        image = crop_regions(self.volumes[row], self.region[row], offset)
+        image = crop_regions(self.volumes[row], self.region[row], offset, self.resolution)
         return image, self.metadata[row], self.labels[row]
 
 
@@ -91,8 +92,8 @@ def train(args: argparse.Namespace) -> None:
         rng = np.random.default_rng(seed)
         train_rows, val_rows = (np.sort(rng.choice(rows, min(args.limit, len(rows)), replace=False))
                                 for rows in (train_rows, val_rows))
-    train_set = RegionDataset(cache, train_rows, region, metadata, labels, augment=True)
-    val_set = RegionDataset(cache, val_rows, region, metadata, labels)
+    train_set = RegionDataset(cache, train_rows, region, metadata, labels, augment=True, resolution=args.resolution)
+    val_set = RegionDataset(cache, val_rows, region, metadata, labels, resolution=args.resolution)
     generator = torch.Generator().manual_seed(seed + 819)
     common = dict(batch_size=args.batch_size, num_workers=args.workers, pin_memory=True,
                   persistent_workers=args.workers > 0)
@@ -105,13 +106,32 @@ def train(args: argparse.Namespace) -> None:
               'final_weights': 'arithmetic_mean_of_last_three_epoch_checkpoints',
               'code_sha256': {name: checksum(Path(__file__).with_name(name)) for name in
                               ('spine_train.py', 'spine_model.py', 'spine_metrics.py')}}
-    model = SpineClassifier(pretrained=True).cuda()
+    if args.parent:
+        config['parent_sha256'] = checksum(args.parent)
+    if args.spatial_detail:
+        config['spatial_detail'] = True
+    if args.resolution != ROI_SIZE:
+        config['resolution'] = args.resolution
+    model = SpineClassifier(pretrained=args.parent is None, spatial_detail=args.spatial_detail).cuda()
+    if args.parent:
+        warm = torch.load(args.parent, map_location='cpu', weights_only=True)
+        provenance = warm['config']
+        caches = (config['cache_sha256'], localization['config'].get('reprojected_from_cache_sha256'))
+        if (provenance['fold'] != args.fold or provenance['folds_sha256'] != config['folds_sha256']
+                or provenance['cache_sha256'] not in caches or provenance['limit'] is not None):
+            raise ValueError('Warm-start model differs from this complete MRI outer fold')
+        changes = model.load_state_dict(warm['model'], strict=False)
+        old_keys = set(warm['model'])
+        detail_keys = {key for key in model.state_dict() if key.startswith('detail.')} - old_keys
+        if set(changes.missing_keys) != detail_keys or changes.unexpected_keys:
+            raise ValueError('Warm-start state differs beyond the spatial detail branch')
     averaged = AveragedModel(model, device='cpu', use_buffers=True)
     backbone = list(model.encoder.parameters())
     backbone_ids = {id(parameter) for parameter in backbone}
     head = [parameter for parameter in model.parameters() if id(parameter) not in backbone_ids]
     optimizer = torch.optim.AdamW([{'params': backbone}, {'params': head}], weight_decay=3e-4, fused=True)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=[1.9e-4, 6e-4],
+    max_lr = [8e-5, 3.2e-4] if args.parent else [1.9e-4, 6e-4]
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=max_lr,
                                                     total_steps=args.epochs * len(train_loader), pct_start=.18)
     scaler = torch.amp.GradScaler('cuda', init_scale=4096)
     history = []
@@ -161,10 +181,12 @@ def train(args: argparse.Namespace) -> None:
         train_loss = float(summed_loss.cpu()) / len(train_set)
         if not np.isfinite(train_loss) or skipped == len(train_loader):
             raise FloatingPointError('Non-finite spine training loss or zero completed optimizer steps')
-        probs, targets = predict(model, val_loader)
-        result = {'epoch': epoch + 1, 'train_loss': train_loss, **score(targets, probs),
+        result = {'epoch': epoch + 1, 'train_loss': train_loss,
                   'seconds': round(time.monotonic() - start, 2), 'skipped_fp16_steps': skipped,
                   'peak_reserved_mib': round(torch.cuda.max_memory_reserved() / 2**20, 1)}
+        if args.parent is None:
+            probs, targets = predict(model, val_loader)
+            result.update(score(targets, probs))
         history.append(result)
         print(result, flush=True)
         if epoch >= args.epochs - 3:
@@ -182,14 +204,14 @@ def train(args: argparse.Namespace) -> None:
               'validation_studies': len(val_rows), 'torch': torch.__version__, 'cuda': torch.version.cuda,
               'parameters': sum(parameter.numel() for parameter in model.parameters()),
               'gpu': torch.cuda.get_device_name(), 'averaged_epoch_count': int(averaged.n_averaged.item())}
-    if args.fold == 0 and not args.limit:
-        oracle_path = args.localization / 'oracle-fold-0.npz'
+    oracle_path = args.localization / 'oracle-fold-0.npz'
+    if args.fold == 0 and not args.limit and oracle_path.is_file():
         with np.load(oracle_path, allow_pickle=False) as oracle:
             if not np.array_equal(oracle['rows'], val_rows):
                 raise ValueError('Localizer oracle rows do not match the fold')
             oracle_region, oracle_meta = region.copy(), metadata.copy()
             oracle_region[val_rows], oracle_meta[val_rows] = oracle['region'], oracle['metadata']
-        oracle_set = RegionDataset(cache, val_rows, oracle_region, oracle_meta, labels)
+        oracle_set = RegionDataset(cache, val_rows, oracle_region, oracle_meta, labels, resolution=args.resolution)
         oracle_probabilities, oracle_truth = predict(model, DataLoader(oracle_set, **common))
         result['oracle_coordinates_sensitivity_only'] = score(oracle_truth, oracle_probabilities)
     save_checkpoint(args.output / 'final.pt', {'model': model.state_dict(), 'config': config})
@@ -208,6 +230,9 @@ def main() -> None:
     parser.add_argument('--workers', type=int, default=0)
     parser.add_argument('--seed', type=int, default=1801)
     parser.add_argument('--limit', type=int)
+    parser.add_argument('--parent', type=Path, help='Warm start from a complete classifier for the same outer fold')
+    parser.add_argument('--spatial-detail', action='store_true', help='Keep coarse spatial details in each ROI token')
+    parser.add_argument('--resolution', type=int, choices=(96, 112, 128), default=ROI_SIZE)
     train(parser.parse_args())
 
 

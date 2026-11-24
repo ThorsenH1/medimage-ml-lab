@@ -42,8 +42,12 @@ class Geometry:
 
 
 def view_pixels(path: Path, canvas: tuple[int, int] = (HEIGHT, WIDTH)) -> tuple[np.ndarray, Geometry]:
+    raw = read_image(path, cv2.IMREAD_GRAYSCALE if canvas[0] > HEIGHT else cv2.IMREAD_REDUCED_GRAYSCALE_2)
+    return view_array(raw, canvas)
+
+
+def view_array(raw: np.ndarray, canvas: tuple[int, int]) -> tuple[np.ndarray, Geometry]:
     height, width = canvas
-    raw = read_image(path, cv2.IMREAD_GRAYSCALE if height > HEIGHT else cv2.IMREAD_REDUCED_GRAYSCALE_2)
     h, w = raw.shape
     pw, ph = 150, 240
     preview = cv2.resize(raw, (pw, ph), interpolation=cv2.INTER_AREA)
@@ -77,7 +81,7 @@ def view_pixels(path: Path, canvas: tuple[int, int] = (HEIGHT, WIDTH)) -> tuple[
     if upper <= lower:
         lower, upper = float(selected.min()), float(selected.max())
     if upper <= lower:
-        raise ValueError(f'Mammogram has insufficient intensity range: {path.name}')
+        raise ValueError('Mammogram has insufficient intensity range')
     normalized = np.clip((raw.astype(np.float32) - lower) * (255. / (upper - lower)), 0, 255).astype(np.uint8)
     normalized = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(normalized)
     normalized[component_mask == 0] = 0

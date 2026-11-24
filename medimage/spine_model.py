@@ -12,31 +12,38 @@ from medimage.spine_metrics import GROUPS
 ROI_SIZE = 96
 
 
-def crop_regions(volume: np.ndarray, coords: np.ndarray, jitter: np.ndarray | None = None) -> np.ndarray:
+def crop_regions(volume: np.ndarray, coords: np.ndarray, jitter: np.ndarray | None = None,
+                 size: int = ROI_SIZE) -> np.ndarray:
     if coords.shape != (30, 3, 5):
         raise ValueError('Expected 30 three-slice MRI regions')
-    pixels = np.zeros((30, 3, ROI_SIZE, ROI_SIZE), dtype=np.uint8)
+    pixels = np.zeros((30, 3, size, size), dtype=np.uint8)
     for index, regions in enumerate(coords):
         delta = (0, 0) if jitter is None else jitter[index]
         for channel, (slot, x, y, width, height) in enumerate(regions):
             if slot < 0:
                 continue
-            sx, sy = width / ROI_SIZE, height / ROI_SIZE
-            ox = x + delta[0] * width - (ROI_SIZE - 1) * sx / 2
-            oy = y + delta[1] * height - (ROI_SIZE - 1) * sy / 2
+            sx, sy = width / size, height / size
+            ox = x + delta[0] * width - (size - 1) * sx / 2
+            oy = y + delta[1] * height - (size - 1) * sy / 2
             matrix = np.array([[sx, 0, ox], [0, sy, oy]], dtype=np.float32)
-            pixels[index, channel] = cv2.warpAffine(volume[int(slot)], matrix, (ROI_SIZE, ROI_SIZE),
+            pixels[index, channel] = cv2.warpAffine(volume[int(slot)], matrix, (size, size),
                                                    flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
     return pixels
 
 
 class SpineClassifier(nn.Module):
-    def __init__(self, pretrained: bool) -> None:
+    def __init__(self, pretrained: bool, spatial_detail: bool = False) -> None:
         super().__init__()
         convnet = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
         self.encoder = nn.Sequential(*list(convnet.children())[:-2]).to(memory_format=torch.channels_last)
         dimension = 160
         self.map = nn.Sequential(nn.Linear(512, dimension), nn.LayerNorm(dimension), nn.GELU(), nn.Dropout(.1))
+        self.detail = None
+        if spatial_detail:
+            self.detail = nn.Sequential(nn.Conv2d(512, 64, 1, bias=False), nn.GroupNorm(8, 64), nn.GELU(),
+                                        nn.AdaptiveAvgPool2d(2), nn.Flatten(), nn.Linear(256, dimension))
+            nn.init.zeros_(self.detail[-1].weight)
+            nn.init.zeros_(self.detail[-1].bias)
         self.condition = nn.Embedding(6, dimension)
         self.level = nn.Embedding(5, dimension)
         self.quality = nn.Sequential(nn.Linear(5, dimension), nn.Tanh())
@@ -51,11 +58,14 @@ class SpineClassifier(nn.Module):
     def forward(self, regions: torch.Tensor, metadata: torch.Tensor) -> torch.Tensor:
         batch, regions_count = regions.shape[:2]
         present = metadata[:, :, 0:1]
-        x = (regions.reshape(-1, 3, ROI_SIZE, ROI_SIZE).float() / 255. - .449) / .226
+        x = (regions.flatten(0, 1).float() / 255. - .449) / .226
         if self.training:
             x = x * torch.empty_like(x[:, :1, :1, :1]).uniform_(.9, 1.1)
-        encoded = self.encoder(x.contiguous(memory_format=torch.channels_last)).mean(dim=(2, 3))
-        image = self.map(encoded).reshape(batch, regions_count, -1) * present
+        encoded = self.encoder(x.contiguous(memory_format=torch.channels_last))
+        visual = self.map(encoded.mean(dim=(2, 3)))
+        if self.detail is not None:
+            visual = visual + self.detail(encoded)
+        image = visual.reshape(batch, regions_count, -1) * present
         token = image + self.condition(self.condition_ids) + self.level(self.level_ids) + self.quality(metadata)
         normalized = self.pre_attention(token)
         interaction, _ = self.self_attention(normalized, normalized, normalized, need_weights=False)

@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file
 from torch import nn
-from torchvision.models import densenet121
+from torchvision.models import densenet121, resnet50
 from torchvision.models.densenet import DenseNet, _DenseBlock, _DenseLayer, _Transition
 
 from medimage.common import checksum
@@ -24,6 +24,8 @@ from medimage.search_features import Encoder
 
 CHEX_HASH = '1a914ae802170187a4852e594708206c12468eeeefd66aa4e8e26141649d61a4'
 DENSE_HASH = 'a639ec97d7c33b07ae66f0b5fb7d0192f95a3b11b7576c66c0126c2a727c4395'
+BIOVIL_T_HASH = '146c244155c930bead77165442c3f3d799b8d26fd0aed627064dd8d53c3b8624'
+CONVNEXT_HASH = '6652fd90fc9c23977659e58515778e16fbbcd43f0b01fc693089cebe6d64c2a9'
 MAMMO_CLIP_HASH = '0baccb0cc19cd6093ff8252f7c2b7a6efbc32973498640abcb311210c46fd02c'
 MAMMO_RSNA_HASH = '743bfaef035b5997c0d70bd7964edc3f29d5a3a099ff96a4386539a426b71727'
 EFFICIENTNET_B3_HASH = '279d2a53898aa89dab43fd6bd7df9f706aea4cb9cf916223988bbcb8e5850469'
@@ -154,6 +156,54 @@ class ChestDense(nn.Module):
         return self.head(torch.cat((features.mean((-1, -2)), features.amax((-1, -2))), dim=-1))
 
 
+class ChestBioViL(nn.Module):
+    """MIMIC-CXR transfer with global and focal evidence heads."""
+
+    def __init__(self, depth: int, dropout: float, pretrained: Path | None) -> None:
+        super().__init__()
+        self.encoder = resnet50()
+        self.encoder.fc = nn.Identity()
+        if pretrained is not None:
+            if checksum(pretrained) != BIOVIL_T_HASH:
+                raise ValueError('The BioViL-T checkpoint differs from the documented release')
+            saved = torch.load(pretrained, map_location='cpu', weights_only=True, mmap=True)
+            prefix = 'encoder.encoder.'
+            state = {name.removeprefix(prefix): value for name, value in saved.items()
+                     if name.startswith(prefix) and not name.startswith(f'{prefix}fc.')}
+            self.encoder.load_state_dict(state)
+        self.encoder.requires_grad_(False)
+        self.encoder.layer4.requires_grad_(True)
+        if depth == 2:
+            self.encoder.layer3.requires_grad_(True)
+        self.global_head = nn.Sequential(nn.LayerNorm(2048), nn.Dropout(dropout), nn.Linear(2048, 14))
+        self.local_head = nn.Sequential(nn.Conv2d(1024, 192, 1), nn.GroupNorm(12, 192),
+                                        nn.GELU(), nn.Dropout2d(dropout), nn.Conv2d(192, 14, 1))
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        for layer in self.encoder.children():
+            if not any(parameter.requires_grad for parameter in layer.parameters()):
+                layer.eval()
+        return self
+
+    def forward(self, pixels: torch.Tensor) -> torch.Tensor:
+        image = pixels[:, None].float() / 255.
+        if self.training:
+            shape = (len(image), 1, 1, 1)
+            gain = torch.empty(shape, device=image.device).uniform_(.85, 1.15)
+            shift = torch.empty(shape, device=image.device).uniform_(-.045, .045)
+            image = (image * gain + shift).clamp_(0, 1)
+            image = torch.where(torch.rand(shape, device=image.device) < .5, image.flip(-1), image)
+        image = image.expand(-1, 3, -1, -1).contiguous(memory_format=torch.channels_last)
+        net = self.encoder
+        features = net.maxpool(net.relu(net.bn1(net.conv1(image))))
+        features = net.layer3(net.layer2(net.layer1(features)))
+        global_score = self.global_head(net.layer4(features).mean((-1, -2)))
+        local = self.local_head(features).flatten(2).float()
+        local_score = (torch.logsumexp(2 * local, dim=-1) - np.log(local.shape[-1])) / 2
+        return global_score.float() + .5 * local_score
+
+
 class ChestReference(ChestClassifier):
     def __init__(self, depth: int) -> None:
         super().__init__(pretrained=False, variant='global')
@@ -167,6 +217,45 @@ class ChestReference(ChestClassifier):
 
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:
         return super().forward(pixels, None)
+
+
+class ChestConvNeXt(nn.Module):
+    """Class-specific spatial pooling alongside whole-image features."""
+
+    def __init__(self, depth: int, dropout: float, pretrained: Path | None) -> None:
+        super().__init__()
+        self.encoder = timm.create_model('convnextv2_tiny.fcmae_ft_in22k_in1k', pretrained=False, num_classes=0)
+        if pretrained is not None:
+            if checksum(pretrained) != CONVNEXT_HASH:
+                raise ValueError('The ConvNeXt checkpoint differs from the documented release')
+            state = {name: value for name, value in load_file(pretrained).items()
+                     if not name.startswith('head.fc.')}
+            self.encoder.load_state_dict(state)
+        self.encoder.requires_grad_(False)
+        self.encoder.stages[-depth:].requires_grad_(True)
+        self.global_head = nn.Sequential(nn.LayerNorm(768), nn.Dropout(dropout), nn.Linear(768, 14))
+        self.region_features = nn.Sequential(nn.Conv2d(384, 128, 1), nn.GroupNorm(8, 128),
+                                             nn.GELU(), nn.Dropout2d(dropout))
+        self.region_score = nn.Conv2d(128, 14, 1)
+        self.region_attention = nn.Conv2d(128, 14, 1)
+        normalization = timm.data.resolve_model_data_config(self.encoder)
+        self.register_buffer('mean', torch.tensor(normalization['mean'])[None, :, None, None], persistent=False)
+        self.register_buffer('std', torch.tensor(normalization['std'])[None, :, None, None], persistent=False)
+
+    def forward(self, pixels: torch.Tensor) -> torch.Tensor:
+        image = pixels[:, None].float() / 255.
+        if self.training:
+            shape = (len(image), 1, 1, 1)
+            gamma = torch.empty(shape, device=image.device).uniform_(.77, 1.25)
+            image = image.clamp_min(1e-6).pow(gamma)
+            image = torch.where(torch.rand(shape, device=image.device) < .5, image.flip(-1), image)
+        image = ((image - self.mean) / self.std).contiguous(memory_format=torch.channels_last)
+        features = self.encoder.stages[:-1](self.encoder.stem(image))
+        whole = self.encoder.stages[-1](features).mean((-1, -2))
+        region = self.region_features(features)
+        activation = self.region_score(region).flatten(2).float()
+        attention = self.region_attention(region).flatten(2).float().softmax(-1)
+        return self.global_head(whole).float() + (attention * activation).sum(dim=-1)
 
 
 class MammographySpatial(nn.Module):

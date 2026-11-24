@@ -67,7 +67,8 @@ def radiography(task: str, examples: Path, trace: dict, output: Path) -> None:
         fig, grid = frame('Chest X-ray inference', 'One synthetic frontal image produces 14 finding scores')
         source = examples / 'phantom.png'
         image(fig.add_subplot(grid[:, 0]), read_image(source, cv2.IMREAD_GRAYSCALE), '1. Open the input')
-        size = trace['components']['reference384']['model_input_shape'][0]
+        size = max(part['model_input_shape'][0] for part in trace['components'].values()
+                   if part['model_input_shape'])
         processed = chest_source(source, size)
         image(fig.add_subplot(grid[:, 1]), processed, f'2. Resize to {size} × {size} pixels')
         show = [trace['labels'].index(key) for key in ('Atelectasis', 'Effusion', 'Pneumonia', 'Pneumothorax')]
@@ -78,7 +79,8 @@ def radiography(task: str, examples: Path, trace: dict, output: Path) -> None:
              'Calibrated score  ·  four of 14 findings', thresholds)
     else:
         fig, grid = frame('Mammography inference', 'Two synthetic projections produce one breast-level score')
-        shape = tuple(trace['components']['sharp1536']['model_input_shape'])
+        shape = max(tuple(part['model_input_shape']) for part in trace['components'].values()
+                    if part['model_input_shape'])
         for row, name in enumerate(('cc', 'mlo')):
             source = examples / f'phantom-{name}.png'
             raw = read_image(source, cv2.IMREAD_GRAYSCALE)
