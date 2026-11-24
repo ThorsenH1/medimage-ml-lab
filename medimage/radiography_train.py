@@ -10,20 +10,13 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader, Dataset
 
 from medimage.common import checksum, read_json, seed_everything, write_json
+from medimage.common import load_manifest as load_frame
 from medimage.radiography_data import CHEST_LABELS, SEED
+from medimage.radiography_evaluate import validation_metrics
 from medimage.radiography_models import build_model
-
-
-def load_frame(cache: Path) -> tuple[pd.DataFrame, dict]:
-    audit = read_json(cache / 'audit.json')
-    path = cache / 'manifest.csv'
-    if checksum(path) != audit['manifest_sha256']:
-        raise ValueError('Manifest changed after preparation')
-    return pd.read_csv(path, keep_default_na=False), audit
 
 
 class ImageCache(Dataset):
@@ -69,15 +62,6 @@ def predict_batches(model, loader: DataLoader) -> tuple[np.ndarray, np.ndarray]:
     if not np.isfinite(result).all():
         raise FloatingPointError('Validation/inference logits are not finite')
     return result, np.concatenate(truth)
-
-
-def validation_metrics(truth: np.ndarray, logits: np.ndarray) -> dict:
-    valid = (truth.min(axis=0) != truth.max(axis=0))
-    if not valid.any():
-        raise ValueError('Validation subset has no evaluable binary target')
-    return {'macro_auroc': float(roc_auc_score(truth[:, valid], logits[:, valid])),
-            'macro_auprc': float(average_precision_score(truth[:, valid], logits[:, valid])),
-            'evaluable_labels': int(valid.sum())}
 
 
 def save_checkpoint(path: Path, state: dict) -> None:

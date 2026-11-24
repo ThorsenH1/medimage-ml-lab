@@ -6,14 +6,13 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import pandas as pd
 import timm
 import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file
 from tqdm import tqdm
 
-from medimage.common import checksum, read_json, write_json
+from medimage.common import checksum, load_manifest, read_json, write_json
 from medimage.radiography_data import prepare_breast, read_image
 
 BACKBONES = {
@@ -88,19 +87,11 @@ def chest_source(path: Path, resolution: int) -> np.ndarray:
     return cv2.resize(image, (resolution, resolution), interpolation=cv2.INTER_AREA)
 
 
-def load_manifest(path: Path) -> tuple[pd.DataFrame, dict]:
-    audit = read_json(path / 'audit.json')
-    manifest = path / 'manifest.csv'
-    if checksum(manifest) != audit['manifest_sha256']:
-        raise ValueError('Search manifest differs from the prepared cohort')
-    return pd.read_csv(manifest, keep_default_na=False), audit
-
-
-def prepare_pixels(task: str, raw: Path, cohort: Path, output: Path, workers: int) -> None:
+def prepare_pixels(task: str, raw: Path, cohort: Path, output: Path, workers: int, *, chest_size: int = 224) -> None:
     cv2.setNumThreads(1)
     frame, audit = load_manifest(cohort)
     output.mkdir(parents=True, exist_ok=True)
-    shape = (len(frame), 224, 224) if task == 'chest' else (len(frame), 2, *MAMMO_SHAPE)
+    shape = (len(frame), chest_size, chest_size) if task == 'chest' else (len(frame), 2, *MAMMO_SHAPE)
     signature = {'task': task, 'manifest': audit['manifest_sha256'], 'shape': list(shape), 'version': 1}
     state_path, complete_path = output / 'progress.json', output / 'pixels.json'
     if complete_path.is_file():
@@ -118,7 +109,7 @@ def prepare_pixels(task: str, raw: Path, cohort: Path, output: Path, workers: in
 
     def read(row):
         if task == 'chest':
-            return chest_source(raw / row.path, 224)
+            return chest_source(raw / row.path, chest_size)
         return np.stack([prepare_breast(raw / name, MAMMO_SHAPE) if name else np.zeros(MAMMO_SHAPE, np.uint8)
                          for name in (row.CC, row.MLO)])
 
@@ -203,6 +194,7 @@ def main() -> None:
         stage.add_argument('--output', type=Path, required=True)
     sub.choices['pixels'].add_argument('--root', type=Path, required=True)
     sub.choices['pixels'].add_argument('--workers', type=int, default=8)
+    sub.choices['pixels'].add_argument('--chest-size', type=int, choices=(224, 320, 384, 448), default=224)
     feature = sub.choices['extract']
     for name in ('pixels', 'weights'):
         feature.add_argument(f'--{name}', type=Path, required=True)
@@ -211,7 +203,7 @@ def main() -> None:
     feature.add_argument('--batch-size', type=int, default=96)
     args = parser.parse_args()
     if args.command == 'pixels':
-        prepare_pixels(args.task, args.root, args.cohort, args.output, args.workers)
+        prepare_pixels(args.task, args.root, args.cohort, args.output, args.workers, chest_size=args.chest_size)
     else:
         extract(args.task, args.cohort, args.pixels, args.output, args.weights, args.backbone, args.resolution, args.batch_size)
 

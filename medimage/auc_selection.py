@@ -1,0 +1,313 @@
+from __future__ import annotations
+
+import argparse
+from itertools import combinations
+from pathlib import Path
+
+import numpy as np
+from scipy.special import expit
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import GroupKFold
+from threadpoolctl import threadpool_limits
+
+from medimage.common import checksum, load_manifest, read_json, write_json
+from medimage.radiography_data import CHEST_LABELS
+from medimage.radiography_evaluate import all_metrics, fit_calibration, patient_bootstrap, validation_metrics
+
+
+def checked(root: Path, relative: str, digest: str | None = None) -> Path:
+    base = root.resolve()
+    location = (base / relative).resolve()
+    if not location.is_relative_to(base) or (digest is not None and checksum(location) != digest):
+        raise ValueError('An experiment artifact is outside its root or differs from its lock')
+    return location
+
+
+def read_scores(path: Path, rows, *, num_labels: int, truth=None, key='logits'):
+    with np.load(path, allow_pickle=False) as data:
+        values = data[key]
+        if not np.array_equal(data['rows'], rows) or values.shape != (len(rows), num_labels):
+            raise ValueError(f'Predictions are misaligned with the frozen cohort: {path.name}')
+        if truth is not None and not np.array_equal(data['labels'], truth):
+            raise ValueError('Previous test labels differ from the frozen cohort')
+        if not np.isfinite(values).all():
+            raise ValueError('Nonfinite predictions')
+        return values.astype(np.float64, copy=False)
+
+
+def previous_validation(args, plan, rows, count):
+    sources = {'incumbent-global': args.previous / 'evaluation' / args.task / 'incumbent-validation.npz',
+               'adapted-incumbent-224': args.previous / 'runs' / args.task / 'adaptation-reference' / 'validation.npz',
+               'adapted-dino-224': args.previous / 'runs' / args.task / 'adaptation' / 'validation.npz'}
+    return sum(weight * read_scores(sources[name], rows, num_labels=count)
+               for name, weight in plan['selected']['weights'].items())
+
+
+def rank_candidate(y, scores, weights, parameters, method):
+    result = merge(scores, weights, parameters if method == 'calibrated-logit' else {})
+    return {'weights': weights, 'method': method, 'metrics': validation_metrics(y, result)}, result
+
+
+def merge(scores, weights, parameters):
+    result = []
+    for key, fraction in weights.items():
+        intercept = np.asarray(parameters.get(key, [[1., 0.] for _ in range(scores[key].shape[1])]))
+        result.append(np.asarray(fraction) * (scores[key] * intercept[:, 0] + intercept[:, 1]))
+    return np.sum(result, axis=0)
+
+
+def cross_fit_calibration(truth, scores, folds):
+    calibrated = {key: np.empty_like(value) for key, value in scores.items()}
+    for fit, check in folds:
+        for key, values in scores.items():
+            parameters, _ = fit_calibration(truth[fit], values[fit])
+            calibrated[key][check] = values[check] * parameters[:, 0] + parameters[:, 1]
+    return calibrated
+
+
+def label_weights(truth, scores, default, strength):
+    quality = np.stack([roc_auc_score(truth, scores[key], average=None) for key in default])
+    minority = np.minimum(truth.sum(axis=0), (1 - truth).sum(axis=0))
+    reliability = minority / (minority + 60)
+    adjusted = np.exp((quality - quality.max(axis=0)) * strength * reliability)
+    adjusted = adjusted * np.asarray(list(default.values()))[:, None]
+    adjusted /= adjusted.sum(axis=0)
+    return {key: value.tolist() for key, value in zip(default, adjusted, strict=True)}
+
+
+def label_adaptive_candidate(truth, scores, calibrated, weights, folds, strength):
+    out = np.empty_like(next(iter(scores.values())))
+    for fit, check in folds:
+        fractions = label_weights(truth[fit], {key: scores[key][fit] for key in weights}, weights, strength)
+        out[check] = merge({key: calibrated[key][check] for key in weights}, fractions, {})
+    return {'weights': weights, 'method': 'calibrated-label-logit', 'weight_strength': strength,
+            'label_weights': label_weights(truth, scores, weights, strength),
+            'metrics': validation_metrics(truth, out)}
+
+
+def validation_lock(args):
+    frame, audit = load_manifest(args.cohort)
+    rows = np.flatnonzero(frame.split.eq('val').to_numpy())
+    labels = CHEST_LABELS if args.task == 'chest' else ('malignancy_in_lesion_enriched_cohort',)
+    truth = frame.loc[:, list(CHEST_LABELS) if args.task == 'chest' else ['positive']].to_numpy(np.int8)[rows]
+    old_path = args.previous / 'evaluation' / args.task / 'selection.json'
+    old_plan = read_json(old_path)
+    if old_plan['manifest'] != audit['manifest_sha256']:
+        raise ValueError('The previous lock covers a different cohort')
+    metadata = {'previous-locked': {'prior_selection_sha256': checksum(old_path)}}
+    scores = {'previous-locked': previous_validation(args, old_plan, rows, len(labels))}
+    for spec in args.candidate:
+        name, separator, relative = spec.partition('=')
+        run, at, pixel_key = relative.partition('@')
+        if not separator or not at or name in metadata or not name or not pixel_key:
+            raise ValueError('Use a unique name=run-directory@pixel-cache candidate')
+        path = checked(args.work, run)
+        record = read_json(path / 'result.json')
+        config = record['config']
+        if config['manifest'] != audit['manifest_sha256'] or config['task'] != args.task:
+            raise ValueError('Candidate training cohort differs from validation cohort')
+        model_path, predictions = path / 'best.pt', path / 'validation.npz'
+        if not model_path.is_file() or checksum(predictions) != record['validation_sha256']:
+            raise ValueError('Candidate model or validation score changed after training')
+        cache = pixels_location(args, pixel_key) / ('pixels.json' if args.task == 'chest' else 'audit.json')
+        if checksum(cache) != config['pixel_sha256']:
+            raise ValueError('Candidate input specification differs from training')
+        signature = read_json(cache)
+        image_shape = signature['shape'][1:] if args.task == 'chest' else signature['config']['shape'][2:]
+        metadata[name] = {'run': run, 'pixels': pixel_key, 'checkpoint_sha256': record['best_sha256'],
+                          'validation_sha256': record['validation_sha256'], 'config': config,
+                          'image_shape': image_shape}
+        scores[name] = read_scores(predictions, rows, num_labels=len(labels))
+    parameters = {key: fit_calibration(truth, values)[0].tolist() for key, values in scores.items()}
+    identities = frame.iloc[rows]['pixel_cluster' if args.task == 'chest' else 'patient'].to_numpy()
+    folds = list(GroupKFold(n_splits=5).split(truth, groups=identities))
+    calibrated_scores = cross_fit_calibration(truth, scores, folds)
+    recipes = [{key: 1.} for key in scores]
+    for left, right in combinations(scores, 2):
+        recipes.extend({left: fraction, right: 1 - fraction} for fraction in (.25, .5, .75))
+    recipes.extend({key: 1 / 3 for key in names} for names in combinations(scores, 3))
+    candidates = []
+    for weights in recipes:
+        methods = ('raw-logit', 'calibrated-logit') if len(weights) > 1 else ('raw-logit',)
+        for method in methods:
+            values = calibrated_scores if method == 'calibrated-logit' else scores
+            candidates.append(rank_candidate(truth, values, weights, {}, method)[0])
+        if args.task == 'chest' and 'previous-locked' in weights and len(weights) > 1:
+            candidates.extend(label_adaptive_candidate(truth, scores, calibrated_scores, weights, folds, strength)
+                              for strength in (8, 24))
+    candidates.sort(key=lambda item: (item['metrics']['macro_auroc'], item['metrics']['macro_auprc']),
+                    reverse=True)
+    selected = candidates[0]
+    selected_logits = selected_scores(lock_selected=selected, scores=scores, calibration=parameters)
+    calibration, thresholds = fit_calibration(truth, selected_logits)
+    lock = {'task': args.task, 'manifest': audit['manifest_sha256'], 'criterion': 'validation macro AUROC, AP tie-breaker',
+            'blend_validation_calibration': 'Five group-disjoint folds inside validation',
+            'validation_rows': len(rows), 'labels': list(labels), 'candidates': metadata,
+            'validation_ranking': candidates, 'selected': selected, 'component_calibration': parameters,
+            'ensemble_calibration': calibration.tolist(), 'thresholds': thresholds.tolist(),
+            'test_role': 'Previously reported official benchmark. Current candidates and calibration locked before scoring.'}
+    path = args.output / 'selection.json'
+    if path.exists() and read_json(path) != lock:
+        raise ValueError('Use a separate output directory for a new benchmark decision')
+    write_json(path, lock)
+    print({'selected': selected, 'evaluated_validation_recipes': len(candidates)}, flush=True)
+
+
+def selected_scores(lock_selected, scores, calibration):
+    parameters = calibration if lock_selected['method'].startswith('calibrated-') else {}
+    return merge(scores, lock_selected.get('label_weights', lock_selected['weights']), parameters)
+
+
+def pixels_location(args, name):
+    if args.task == 'chest' and name == 'previous-chest224':
+        return args.previous / 'pixels' / 'chest'
+    return checked(args.work / 'pixels', name)
+
+
+def load_component(work: Path, candidate, weights: Path, clip: Path | None):
+    import torch
+
+    from medimage.auc_patches import PatchNet
+    from medimage.auc_train import new_model
+
+    path = checked(work, candidate['run'])
+    checkpoint = checked(path, 'best.pt', candidate['checkpoint_sha256'])
+    saved = torch.load(checkpoint, map_location='cpu', weights_only=True)
+    config = saved['config']
+    if config != candidate['config']:
+        raise ValueError('Checkpoint recipe differs from the frozen selection')
+    if config['backbone'] == 'chest-fusion':
+        from medimage.auc_fusion import FusionHead, FusionRecipe
+
+        model = FusionHead(config['dimensions'], FusionRecipe(**config['recipe']))
+    elif config['backbone'] == 'patch-r18':
+        model = PatchNet(weights)
+    else:
+        model = new_model(config, clip if config['backbone'] == 'mammo-clip' else weights)
+    if config['task'] == 'mammo' and model.weight_sha256 != config['weight_sha256']:
+        raise ValueError('Mammography foundation differs from the selected recipe')
+    model.load_state_dict(saved['model'])
+    model.cuda().to(memory_format=torch.channels_last).eval()
+    return model, saved
+
+
+def component_logits(model, saved, arrays, rows):
+    from medimage.auc_patches import scan
+    from medimage.auc_train import predict
+
+    config = saved['config']
+    if config['backbone'] == 'patch-r18':
+        logits = scan(model, arrays, rows)[saved['pooling']]
+    else:
+        logits = predict(model, config['task'], arrays, rows, config['batch'], config['tta'],
+                         np.asarray(saved['prior_correction'], dtype=np.float32))
+    return logits.astype(np.float64)
+
+
+def test_component(args, candidate, rows):
+    config = candidate['config']
+    if config['backbone'] == 'chest-fusion':
+        from medimage.auc_fusion import bank_for, cached_prediction
+
+        model, saved = load_component(args.work, candidate, args.weights, args.clip)
+        banks = bank_for(args.previous / 'features' / 'chest', config['profiles'], config['manifest'], rows)
+        return cached_prediction(model, banks, rows, np.asarray(saved['prior_correction'], dtype=np.float32))
+
+    from medimage.auc_train import store
+
+    _, _, arrays, signature = store(args.task, args.cohort, pixels_location(args, candidate['pixels']))
+    if signature != candidate['config']['pixel_sha256']:
+        raise ValueError('Test pixel representation differs from training')
+    model, saved = load_component(args.work, candidate, args.weights, args.clip)
+    return component_logits(model, saved, arrays, rows)
+
+
+def prediction_examples(task, frame, rows, truth, probabilities, thresholds, labels):
+    rng = np.random.default_rng(80015)
+    order = rng.permutation(len(rows))
+    examples = []
+    for matching_truth, matching_call in ((1, 1), (0, 0), (0, 1), (1, 0)):
+        target = (truth[order] == matching_truth) & ((probabilities[order] >= thresholds) == bool(matching_call))
+        if not target.any():
+            continue
+        row, column = np.argwhere(target)[0]
+        actual = order[row]
+        sample = frame.iloc[rows[actual]]
+        projection = sample['view'] if task == 'chest' else '+'.join(view for view in ('CC', 'MLO') if sample[view])
+        examples.append({'example': len(examples) + 1, 'target': labels[column], 'projection': projection,
+                         'reference': matching_truth, 'decision': matching_call,
+                         'probability': float(probabilities[actual, column]), 'threshold': float(thresholds[column])})
+    return examples
+
+
+def evaluate_lock(args):
+    import torch
+
+    torch.set_num_threads(4)
+    torch.backends.cudnn.benchmark = False
+    frame, audit = load_manifest(args.cohort)
+    path = args.output / 'selection.json'
+    lock = read_json(path)
+    if lock['task'] != args.task or lock['manifest'] != audit['manifest_sha256']:
+        raise ValueError('Locked decision covers another evaluation cohort')
+    rows = np.flatnonzero(frame.split.eq('test').to_numpy())
+    labels = tuple(lock['labels'])
+    truth = frame.loc[:, list(CHEST_LABELS) if args.task == 'chest' else ['positive']].to_numpy(np.int8)[rows]
+    reference = args.previous / 'evaluation' / args.task
+    if checksum(reference / 'selection.json') != lock['candidates']['previous-locked']['prior_selection_sha256']:
+        raise ValueError('Previous benchmark lock changed')
+    before = read_scores(reference / 'test-predictions.npz', rows, num_labels=len(labels), truth=truth,
+                         key='probabilities')
+    previous_logits = read_scores(reference / 'test-predictions.npz', rows, num_labels=len(labels), truth=truth)
+    selected = lock['selected']
+    scores = {}
+    for key in selected['weights']:
+        print(f'Scoring locked component {key} on {len(rows)} official test examples', flush=True)
+        scores[key] = previous_logits if key == 'previous-locked' else test_component(args, lock['candidates'][key], rows)
+        torch.cuda.empty_cache()
+    logits = selected_scores(selected, scores, lock['component_calibration'])
+    parameters = np.asarray(lock['ensemble_calibration'])
+    probabilities = expit(logits * parameters[:, 0] + parameters[:, 1])
+    thresholds = np.asarray(lock['thresholds'])
+    benchmark = all_metrics(truth, probabilities, thresholds, labels)
+    reference_metrics = all_metrics(truth, before, np.asarray(read_json(reference / 'selection.json')['thresholds']), labels)
+    bootstrap = patient_bootstrap(truth, probabilities, frame.iloc[rows].patient.to_numpy(),
+                                  repeats=args.bootstrap, reference=before)
+    report = {'task': args.task, 'selection_sha256': checksum(path), 'selected': selected, 'test': benchmark,
+              'reference_test': reference_metrics, 'test_uncertainty': bootstrap,
+              'auroc_delta': benchmark['macro_auroc'] - reference_metrics['macro_auroc'],
+              'examples': prediction_examples(args.task, frame, rows, truth, probabilities, thresholds, labels)}
+    if args.task == 'mammo':
+        strata = frame.iloc[rows].type.to_numpy()
+    else:
+        strata = frame.iloc[rows].view.to_numpy()
+    report['test_subsets'] = {str(key): all_metrics(truth[strata == key], probabilities[strata == key],
+                                                  thresholds, labels) for key in np.unique(strata)}
+    temporary = args.output / 'test-predictions.partial.npz'
+    np.savez_compressed(temporary, rows=rows, labels=truth,
+                        probabilities=probabilities, logits=logits)
+    temporary.replace(args.output / 'test-predictions.npz')
+    write_json(args.output / 'metrics.json', report)
+    print({key: benchmark[key] for key in ('rows', 'macro_auroc', 'macro_auprc')}, flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Lock validation winners separately from official benchmark evaluation')
+    parser.add_argument('phase', choices=('lock', 'test'))
+    parser.add_argument('task', choices=('chest', 'mammo'))
+    for name in ('work', 'previous', 'cohort', 'output'):
+        parser.add_argument(f'--{name}', type=Path, required=True)
+    parser.add_argument('--candidate', action='append', default=[])
+    parser.add_argument('--weights', type=Path)
+    parser.add_argument('--clip', type=Path)
+    parser.add_argument('--bootstrap', type=int, default=1000)
+    args = parser.parse_args()
+    if args.phase == 'lock':
+        with threadpool_limits(limits=2):
+            validation_lock(args)
+    else:
+        evaluate_lock(args)
+
+
+if __name__ == '__main__':
+    main()

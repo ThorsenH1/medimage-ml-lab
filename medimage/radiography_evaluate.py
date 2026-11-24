@@ -12,6 +12,15 @@ from medimage.common import checksum, read_json, write_json
 from medimage.radiography_data import CHEST_LABELS
 
 
+def validation_metrics(truth: np.ndarray, logits: np.ndarray) -> dict:
+    valid = truth.min(axis=0) != truth.max(axis=0)
+    if not valid.any():
+        raise ValueError('Validation subset has no evaluable binary target')
+    return {'macro_auroc': float(roc_auc_score(truth[:, valid], logits[:, valid])),
+            'macro_auprc': float(average_precision_score(truth[:, valid], logits[:, valid])),
+            'evaluable_labels': int(valid.sum())}
+
+
 def fit_calibration(truth: np.ndarray, logits: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     parameters = []
     thresholds = []

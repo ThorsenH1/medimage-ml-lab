@@ -30,8 +30,7 @@ def checked_file(artifact: dict, original: Path, search: Path) -> Path:
 
 
 @torch.inference_mode()
-def radiography(args: argparse.Namespace) -> None:
-    lock = read_json(args.selection)
+def radiography_logits(args: argparse.Namespace, lock: dict) -> tuple[np.ndarray, list[str]]:
     task = lock['task']
     if task == 'chest':
         if args.image is None or args.cc is not None or args.mlo is not None:
@@ -89,6 +88,13 @@ def radiography(args: argparse.Namespace) -> None:
                 head.load_state_dict(saved['model'])
                 raw = head(encoded, mask)[0].float().cpu().numpy()
                 values += ratio / len(paths) * (raw - np.log(saved['loss_weights']))
+    return values, projections
+
+
+def radiography(args: argparse.Namespace) -> None:
+    lock = read_json(args.selection)
+    values, projections = radiography_logits(args, lock)
+    task = lock['task']
     fitted = np.asarray(lock['slope_intercept'])
     probability = expit(values * fitted[:, 0] + fitted[:, 1])
     if not np.isfinite(probability).all():

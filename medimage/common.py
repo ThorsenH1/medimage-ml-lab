@@ -25,6 +25,16 @@ def checksum(path: Path) -> str:
         return hashlib.file_digest(handle, 'sha256').hexdigest()
 
 
+def load_manifest(path: Path):
+    import pandas as pd
+
+    audit = read_json(path / 'audit.json')
+    manifest = path / 'manifest.csv'
+    if checksum(manifest) != audit['manifest_sha256']:
+        raise ValueError('Manifest changed after cohort preparation')
+    return pd.read_csv(manifest, keep_default_na=False), audit
+
+
 def assert_disjoint(groups: np.ndarray, split: np.ndarray) -> None:
     memberships = {}
     for group, partition in zip(groups, split, strict=True):
