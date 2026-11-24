@@ -16,7 +16,7 @@ from medimage.search_features import MAMMO_SHAPE, Encoder, chest_source, mammogr
 from medimage.search_heads import FeatureClassifier, Recipe
 from medimage.search_spine import SpineFeatureHead, SpineRecipe, probabilities
 from medimage.search_spine_features import feature_rows
-from medimage.spine_data import prepare
+from medimage.spine_data import TARGETS, prepare
 from medimage.spine_localize import SpineCache, inference_regions
 from medimage.spine_metrics import apply_temperature, read_submission, submission
 
@@ -115,8 +115,12 @@ def spine(args: argparse.Namespace) -> None:
         raise ValueError('MRI encoder evidence does not match the locked selection')
     selected = decision['selected']
     raw, calibrated = [], []
+    trace_regions = None
     for item in decision['folds']:
         coords, metadata = inference_regions(cache, args.localization, item['fold'])
+        if args.trace and trace_regions is None:
+            trace_regions = {'fold': item['fold'], 'coordinates': coords[:, :25].tolist(),
+                             'quality': metadata[:, :25].tolist()}
         vectors = torch.from_numpy(feature_rows(encoder, cache, rows, coords)).cuda()
         information = torch.from_numpy(metadata).cuda()
         predictions = []
@@ -146,6 +150,16 @@ def spine(args: argparse.Namespace) -> None:
     write_json(args.output.with_suffix('.json'), {'rows': len(result), 'studies': len(cache.studies),
                                                   'selected': selected['name'], 'selection_sha256': checksum(args.selection),
                                                   'checkpoint_folds': len(decision['folds'])})
+    if args.trace:
+        write_json(args.trace, {'task': 'spine', 'selection_sha256': checksum(args.selection),
+                                'studies': cache.studies.tolist(), 'targets': list(TARGETS),
+                                'reference_fraction': 1 - fraction, 'new_model_fraction': fraction,
+                                'reference_probabilities': incumbent.tolist(),
+                                'folds': [item['fold'] for item in decision['folds']],
+                                'fold_probabilities': np.asarray(calibrated if selected['calibrated'] else raw).tolist(),
+                                'new_model_probabilities': features.tolist(),
+                                'blended_probabilities': probabilities_out.tolist(),
+                                'first_fold_regions': trace_regions})
     print(f'Raw MRI test inference verified for {len(result)} rows', flush=True)
 
 
@@ -157,12 +171,16 @@ def main() -> None:
         command = sub.add_parser(task)
         for name in ('selection', 'search', 'weights', 'output', *options):
             command.add_argument(f'--{name}', type=Path, required=name not in {'image', 'cc', 'mlo'})
+        if task == 'spine':
+            command.add_argument('--trace', type=Path, help='Write a separate JSON file for the scoring steps')
     args = parser.parse_args()
     torch.set_num_threads(4)
     torch.backends.cudnn.benchmark = False
     if args.task == 'radiography':
         radiography(args)
     else:
+        if args.trace and args.trace.resolve() in (args.output.resolve(), args.output.with_suffix('.json').resolve()):
+            parser.error('Use different output paths for the submission, summary and trace')
         spine(args)
 
 

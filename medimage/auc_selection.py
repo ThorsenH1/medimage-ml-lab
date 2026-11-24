@@ -49,12 +49,14 @@ def rank_candidate(y, scores, weights, parameters, method):
     return {'weights': weights, 'method': method, 'metrics': validation_metrics(y, result)}, result
 
 
-def merge(scores, weights, parameters):
-    result = []
+def weighted_components(scores, weights, parameters):
     for key, fraction in weights.items():
-        intercept = np.asarray(parameters.get(key, [[1., 0.] for _ in range(scores[key].shape[1])]))
-        result.append(np.asarray(fraction) * (scores[key] * intercept[:, 0] + intercept[:, 1]))
-    return np.sum(result, axis=0)
+        scaling = np.asarray(parameters.get(key, [[1., 0.] for _ in range(scores[key].shape[1])]))
+        yield key, np.asarray(fraction) * (scores[key] * scaling[:, 0] + scaling[:, 1])
+
+
+def merge(scores, weights, parameters):
+    return np.sum([value for _, value in weighted_components(scores, weights, parameters)], axis=0)
 
 
 def cross_fit_calibration(truth, scores, folds):

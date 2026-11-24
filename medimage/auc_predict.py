@@ -9,7 +9,7 @@ import torch
 from scipy.special import expit
 
 from medimage.auc_mammo_data import view_pixels
-from medimage.auc_selection import component_logits, load_component, selected_scores
+from medimage.auc_selection import component_logits, load_component, selected_scores, weighted_components
 from medimage.common import checksum, read_json, write_json
 from medimage.search_features import chest_source
 from medimage.search_predict import radiography_logits
@@ -22,6 +22,22 @@ def arrays_for(task, shape, args):
     pixels = np.stack([view_pixels(image, tuple(shape))[0] if image else np.zeros(shape, dtype=np.uint8)
                        for image in images])
     return {'pixels': pixels[None], 'views': np.asarray([[image is not None for image in images]], dtype=bool)}
+
+
+def prediction_trace(lock, logits, probabilities, projections, checksum_value):
+    selection = lock['selected']
+    weights = selection.get('label_weights', selection['weights'])
+    calibration = lock['component_calibration'] if selection['method'].startswith('calibrated-') else {}
+    parts = dict(weighted_components(logits, weights, calibration))
+    combined = selected_scores(selection, logits, lock['component_calibration'])[0]
+    return {'task': lock['task'], 'projections': projections, 'selection_sha256': checksum_value,
+            'blend_method': selection['method'], 'labels': lock['labels'],
+            'components': {name: {'weight': weights[name], 'raw_logit': scores[0].tolist(),
+                                  'weighted_logit': parts[name][0].tolist(),
+                                  'model_input_shape': lock['candidates'][name].get('image_shape')}
+                           for name, scores in logits.items()},
+            'fused_logit': combined.tolist(), 'calibration': lock['ensemble_calibration'],
+            'probability': probabilities.tolist(), 'validation_threshold': lock['thresholds']}
 
 
 def evaluate(args):
@@ -66,8 +82,11 @@ def evaluate(args):
     values = {label: {'probability': float(probability), 'validation_threshold': threshold,
                       'threshold_crossed': bool(probability >= threshold)}
               for label, probability, threshold in zip(lock['labels'], probabilities, lock['thresholds'], strict=True)}
+    selection_sha256 = checksum(args.selection)
     write_json(args.output, {'task': task, 'purpose': 'research and education', 'projections': projections,
-                             'selection_sha256': checksum(args.selection), 'scores': values})
+                             'selection_sha256': selection_sha256, 'scores': values})
+    if args.trace:
+        write_json(args.trace, prediction_trace(lock, logits, probabilities, projections, selection_sha256))
 
 
 def main():
@@ -76,7 +95,11 @@ def main():
         parser.add_argument(f'--{name}', type=Path, required=True)
     for name in ('image', 'cc', 'mlo', 'clip'):
         parser.add_argument(f'--{name}', type=Path)
-    evaluate(parser.parse_args())
+    parser.add_argument('--trace', type=Path, help='Write a separate JSON file for the scoring steps')
+    args = parser.parse_args()
+    if args.trace and args.trace.resolve() == args.output.resolve():
+        parser.error('Use different output paths for scores and the trace')
+    evaluate(args)
 
 
 if __name__ == '__main__':
