@@ -44,6 +44,15 @@ def prediction_trace(lock, logits, probabilities, projections, checksum_value):
             'probability': probabilities.tolist(), 'validation_threshold': lock['thresholds']}
 
 
+def calibrated_probabilities(lock, logits):
+    combined = selected_scores(lock['selected'], logits, lock['component_calibration'])
+    calibration = np.asarray(lock['ensemble_calibration'])
+    probabilities = expit(combined * calibration[:, 0] + calibration[:, 1])
+    if not np.isfinite(probabilities).all():
+        raise ValueError('Expected finite calibrated research scores')
+    return probabilities
+
+
 def evaluate(args):
     torch.set_num_threads(4)
     lock = read_json(args.selection)
@@ -84,11 +93,7 @@ def evaluate(args):
                 logits[name] = component_logits(model, saved, pixels, np.zeros(1, dtype=np.int64), args.weights)
             del model
         torch.cuda.empty_cache()
-    combined = selected_scores(selected, logits, lock['component_calibration'])[0]
-    calibration = np.asarray(lock['ensemble_calibration'])
-    probabilities = expit(combined * calibration[:, 0] + calibration[:, 1])
-    if not np.isfinite(probabilities).all():
-        raise ValueError('Expected finite calibrated research scores')
+    probabilities = calibrated_probabilities(lock, logits)[0]
     values = {label: {'probability': float(probability), 'validation_threshold': threshold,
                       'threshold_crossed': bool(probability >= threshold)}
               for label, probability, threshold in zip(lock['labels'], probabilities, lock['thresholds'], strict=True)}

@@ -82,9 +82,12 @@ def mammography_tiles(images: torch.Tensor, resolution: int) -> torch.Tensor:
     return torch.stack(comparable, dim=1).reshape(batch, views, 7, *size)
 
 
-def chest_source(path: Path, resolution: int) -> np.ndarray:
-    image = read_image(path, cv2.IMREAD_GRAYSCALE)
+def chest_pixels(image: np.ndarray, resolution: int) -> np.ndarray:
     return cv2.resize(image, (resolution, resolution), interpolation=cv2.INTER_AREA)
+
+
+def chest_source(path: Path, resolution: int) -> np.ndarray:
+    return chest_pixels(read_image(path, cv2.IMREAD_GRAYSCALE), resolution)
 
 
 def prepare_pixels(task: str, raw: Path, cohort: Path, output: Path, workers: int, *, chest_size: int = 224) -> None:

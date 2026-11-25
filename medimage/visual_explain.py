@@ -65,7 +65,7 @@ def soften(image: np.ndarray, boxes: list[tuple[int, int, int, int]]) -> list[np
     return changed
 
 
-def impact_overlay(axis, model_input, scores):
+def impact_overlay(axis, model_input, scores, *, scale_floor=.015, fade=False):
     axis.imshow(model_input, cmap='gray', vmin=0, vmax=np.iinfo(model_input.dtype).max)
     impact = np.zeros(model_input.shape, dtype=np.float32)
     overlap = np.zeros_like(impact)
@@ -75,11 +75,13 @@ def impact_overlay(axis, model_input, scores):
         impact[y0:y1, x0:x1] += weight * row['score_drop']
         overlap[y0:y1, x0:x1] += weight
     impact = np.divide(impact, overlap, out=impact, where=overlap > 0)
-    scale = max(.015, float(np.abs(impact).max()))
+    scale = max(scale_floor, float(np.abs(impact).max()), np.finfo(np.float32).eps)
     visible = (overlap > .10) & (np.abs(impact) > .04 * scale)
-    axis.imshow(np.ma.masked_where(~visible, impact), alpha=.72, cmap='RdBu_r', vmin=-scale, vmax=scale)
+    alpha = .72 * np.sqrt(np.clip(np.abs(impact) * overlap / scale, 0, 1)) if fade else .72
+    layer = axis.imshow(np.ma.masked_where(~visible, impact), alpha=alpha, cmap='RdBu_r', vmin=-scale, vmax=scale)
     axis.text(.5, -.065, 'Red lowered the score, blue raised it', transform=axis.transAxes,
               ha='center', fontsize=9)
+    return layer
 
 
 def figure(label, original, edited, bounds, model_input, scores, output):
