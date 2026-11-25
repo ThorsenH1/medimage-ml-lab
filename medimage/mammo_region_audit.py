@@ -21,8 +21,9 @@ KINDS = ('mass', 'calc')
 METRICS = ('peak_overlap', 'tissue_center_overlap', 'uniform_tissue_expectation')
 
 
-def test_masks(root: Path, test_views: set[str]) -> tuple[dict, dict, dict]:
-    columns = ['image_path', 'SeriesDescription', 'SeriesInstanceUID', 'Rows', 'Columns']
+def test_masks(root: Path, test_views: set[str], recover: bool = False) -> tuple[dict, dict, dict]:
+    columns = ['image_path', 'SeriesDescription', 'SeriesInstanceUID', 'Rows', 'Columns', 'BitsStored',
+               'SmallestImagePixelValue', 'LargestImagePixelValue']
     metadata = root / 'csv' / 'dicom_info.csv'
     table = pd.read_csv(metadata, usecols=columns, keep_default_na=False)
     table = table[table.image_path.str.startswith('CBIS-DDSM/')].copy()
@@ -42,18 +43,45 @@ def test_masks(root: Path, test_views: set[str]) -> tuple[dict, dict, dict]:
             if len(full) != 1:
                 raise ValueError('An official-test annotation matched multiple cohort projections')
             target = full[0]
+            roi_series = _uid(row['ROI mask file path'])
             alternatives = {entry.path: entry for key in ('ROI mask file path', 'cropped image file path')
                             for entry in series.get(_uid(row[key]), ())}
             masks = []
+            unlabeled = []
             for relative, entry in alternatives.items():
                 vertical, horizontal = entry.Rows / target.Rows, entry.Columns / target.Columns
-                if (entry.SeriesDescription.strip().lower() == 'roi mask images'
-                        and .8 < vertical < 1.2 and .8 < horizontal < 1.2
-                        and abs(vertical / horizontal - 1.) < .025 and (root / relative).is_file()):
+                description = entry.SeriesDescription.strip().lower()
+                if not (root / relative).is_file():
+                    continue
+                if (description == 'roi mask images' and .8 < vertical < 1.2 and .8 < horizontal < 1.2
+                        and abs(vertical / horizontal - 1.) < .025):
                     masks.append(relative)
-            references[target.path].append((kind, masks[0] if len(masks) == 1 else None))
-            counts[f'{kind}_unique_masks' if len(masks) == 1 else f'{kind}_unmatched_masks'] += 1
+                if (recover and kind == 'calc' and not description and entry.SeriesInstanceUID == roi_series
+                        and str(entry.BitsStored) in ('8', '8.0')
+                        and str(entry.SmallestImagePixelValue) in ('0', '0.0')
+                        and str(entry.LargestImagePixelValue) in ('255', '255.0')):
+                    if (entry.Rows, entry.Columns) == (target.Rows, target.Columns):
+                        unlabeled.append(relative)
+                    else:
+                        counts['calc_unlabeled_dimension_mismatch'] += 1
+            if len(masks) == 1:
+                references[target.path].append((kind, masks[0], False))
+                counts[f'{kind}_unique_masks'] += 1
+            elif not masks and len(unlabeled) == 1:
+                references[target.path].append((kind, unlabeled[0], True))
+                counts['calc_unlabeled_candidates'] += 1
+            else:
+                counts[f'{kind}_unmatched_masks'] += 1
     return references, dict(counts), hashes
+
+
+def plausible_unlabeled_mask(pixels: np.ndarray, expected_shape: tuple[int, int]) -> bool:
+    if pixels.shape != expected_shape:
+        return False
+    histogram = cv2.calcHist([pixels], [0], None, [256], [0, 256]).ravel()
+    extreme = histogram[:16].sum() + histogram[240:].sum()
+    foreground = histogram[128:].sum() / pixels.size
+    return extreme > .99 * pixels.size and 2e-7 <= foreground <= .25
 
 
 def grid_evidence(maps: np.ndarray, pixels: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -102,7 +130,7 @@ def evaluate(args: argparse.Namespace) -> None:
     positions = np.flatnonzero(frame.split.eq('test'))
     held_out = frame.iloc[positions]
     test_views = (set(held_out.CC) | set(held_out.MLO)) - {''}
-    references, mapping, input_hashes = test_masks(args.root, test_views)
+    references, mapping, input_hashes = test_masks(args.root, test_views, args.recover_unlabeled_masks)
     model, _ = load_component(args.work, candidate, args.weights, args.clip)
     canvas = arrays['pixels'].shape[-2:]
     observations, skipped = defaultdict(list), Counter()
@@ -112,12 +140,19 @@ def evaluate(args: argparse.Namespace) -> None:
         pixels, geometry = view_pixels(checked(args.root, path), canvas)
         union = np.zeros((2, *canvas), dtype=bool)
         counts = Counter()
-        for kind, mask in references[path]:
-            if mask is None:
+        for kind, mask, recovered in references[path]:
+            decoded = read_image(checked(args.root, mask), cv2.IMREAD_GRAYSCALE)
+            if recovered and not plausible_unlabeled_mask(decoded, geometry.source):
+                counts['calc_unlabeled_invalid_pixels'] += 1
                 continue
-            raw = (read_image(checked(args.root, mask), cv2.IMREAD_GRAYSCALE) > 127).astype(np.float32)
+            raw = (decoded > 127).astype(np.float32)
             aligned = geometry.transform(raw, cv2.INTER_AREA) > .12
             if 4 <= aligned.sum() <= aligned.size * .4:
+                if recovered:
+                    if (aligned & (pixels > 0)).sum() < .90 * aligned.sum():
+                        counts['calc_unlabeled_misaligned'] += 1
+                        continue
+                    counts['calc_unlabeled_accepted'] += 1
                 union[KINDS.index(kind)] |= aligned
             else:
                 counts[f'{kind}_invalid_aligned_masks'] += 1
@@ -147,7 +182,8 @@ def evaluate(args: argparse.Namespace) -> None:
         raise ValueError('Both lesion types need matched masks to report the audit')
     report = {'selection_sha256': checksum(args.selection), 'checkpoint_sha256': candidate['checkpoint_sha256'],
               'mask_source_sha256': input_hashes, 'test_views': len(test_views), 'mapping': mapping,
-              'invalid_aligned_masks': dict(skipped), 'bootstrap_repeats': args.bootstrap,
+              'mask_alignment_checks': dict(skipped), 'bootstrap_repeats': args.bootstrap,
+              'include_unlabeled_masks': args.recover_unlabeled_masks,
               'method': ('Maximum raw logit across all four lesion channels, choosing one cell with at least 25% tissue. '
                          'Any aligned mask pixel in that cell counts as an overlap. No flip pooling.'),
               'results': {key: averages(rows, args.bootstrap) for key, rows in observations.items()}}
@@ -161,6 +197,8 @@ def main() -> None:
         parser.add_argument(f'--{name}', required=True, type=Path)
     parser.add_argument('--clip', type=Path)
     parser.add_argument('--component', default='view-supervised')
+    parser.add_argument('--recover-unlabeled-masks', action='store_true',
+                        help='Check full-size, near-binary files in the official calcification mask series')
     parser.add_argument('--batch', type=int, default=4)
     parser.add_argument('--workers', type=int, default=3)
     parser.add_argument('--bootstrap', type=int, default=1000)
