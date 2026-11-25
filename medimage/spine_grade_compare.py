@@ -43,8 +43,9 @@ def compare(args: argparse.Namespace) -> None:
                'baseline_sha256': checksum(args.baseline),
                'comparison': 'Fixed spatial-detail model and an equal-weight research blend on the existing folds'}
     for key, probabilities in (('baseline', existing), ('detail', model), ('equal_blend', equal_blend)):
+        reference = existing if key == 'equal_blend' and args.paired else None
         summary[key] = {**classification_summary(y, probabilities),
-                        **interval(y, probabilities, assignments, args.bootstrap)}
+                        **interval(y, probabilities, assignments, args.bootstrap, reference=reference)}
         print(key, summary[key], flush=True)
     args.output.mkdir(parents=True, exist_ok=False)
     submission(studies, model).to_csv(args.output / 'detail-oof.csv', index=False)
@@ -57,6 +58,7 @@ def main() -> None:
     for name in ('root', 'folds', 'runs', 'baseline', 'output'):
         parser.add_argument(f'--{name}', type=Path, required=True)
     parser.add_argument('--bootstrap', type=int, default=1000)
+    parser.add_argument('--paired', action='store_true', help='Resample the blend and reference on the same studies')
     args = parser.parse_args()
     if args.bootstrap < 1:
         parser.error('Bootstrap count must be positive')

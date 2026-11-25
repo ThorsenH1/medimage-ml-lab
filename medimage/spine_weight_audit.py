@@ -11,7 +11,7 @@ from medimage.common import checksum, read_json, write_json
 from medimage.spine_detail_infer import GRADE_WEIGHT_EXPONENT, LATERAL, adjust_lateral_grades
 from medimage.spine_geometry_probe import classification_summary
 from medimage.spine_localize import SpineCache, read_folds
-from medimage.spine_metrics import SAMPLE_WEIGHTS, check_probabilities, read_submission, read_targets
+from medimage.spine_metrics import SAMPLE_WEIGHTS, check_probabilities, read_submission, read_targets, submission
 
 
 def compensate(selected: np.ndarray, reference: np.ndarray) -> np.ndarray:
@@ -52,6 +52,9 @@ def evaluate(args: argparse.Namespace) -> None:
               'partially_corrected_lateral': {**classification_summary(truth, adjusted),
                                               **interval(truth, adjusted, folds, args.bootstrap, reference=baseline)}}
     write_json(args.output, report)
+    if args.predictions_output:
+        args.predictions_output.parent.mkdir(parents=True, exist_ok=True)
+        submission(cache.studies, adjusted).to_csv(args.predictions_output, index=False)
     print(report, flush=True)
 
 
@@ -60,9 +63,12 @@ def main() -> None:
     for name in ('root', 'cache', 'folds', 'reference', 'zoom', 'output'):
         parser.add_argument(f'--{name}', type=Path, required=True)
     parser.add_argument('--bootstrap', type=int, default=1000)
+    parser.add_argument('--predictions-output', type=Path, help='Save the adjusted held-out probabilities locally')
     args = parser.parse_args()
     if args.bootstrap < 1:
         parser.error('Use a positive bootstrap count')
+    if args.predictions_output and args.predictions_output.resolve() == args.output.resolve():
+        parser.error('Use separate paths for the metrics and held-out probabilities')
     evaluate(args)
 
 

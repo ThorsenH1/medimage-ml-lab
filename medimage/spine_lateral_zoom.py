@@ -18,11 +18,50 @@ from medimage.spine_metrics import read_submission, read_targets, submission
 from medimage.spine_model import ROI_SIZE, SpineClassifier
 from medimage.spine_train import RegionDataset, _load_fold, predict
 
+
 def blend_lateral(baseline: np.ndarray, reference: np.ndarray, zoom: np.ndarray) -> np.ndarray:
     combined = baseline.copy()
     zoomed_ensemble = .5 * (reference[:, LATERAL] + zoom[:, LATERAL])
     combined[:, LATERAL] = (1 - ZOOM_BLEND) * baseline[:, LATERAL] + ZOOM_BLEND * zoomed_ensemble
     return combined
+
+
+def score_crop_pass(args, cache, folds, files, base_shape, plan_sha, transform, name):
+    blank_labels = np.full(base_shape[:2], -1, dtype=np.int64)
+    predictions = np.empty(base_shape, dtype=np.float64)
+    coverage = {}
+    for fold in range(5):
+        rows = np.flatnonzero(folds == fold)
+        cached = args.output / f'fold-{fold}-{name}-oof.csv'
+        note = cached.with_suffix('.json')
+        if note.exists():
+            saved = read_json(note)
+            if saved['plan_sha256'] != plan_sha or saved['prediction_sha256'] != checksum(cached):
+                raise ValueError('Cached crop predictions belong to another comparison')
+            predictions[rows] = read_submission(cached, cache.studies[rows])
+            coverage[str(fold)] = saved['reflected']
+            print(f'Reusing measured {name} views for fold {fold}', flush=True)
+            continue
+        coordinates, quality = _load_fold(args.regions / f'fold-{fold}.npz', cache, folds, fold)
+        coordinates = transform(coordinates)
+        resolution = files[str(fold)]['resolution']
+        saved = torch.load(args.runs / f'fold-{fold}' / 'final.pt', map_location='cpu', weights_only=True)
+        model = SpineClassifier(pretrained=False, spatial_detail=True).cuda()
+        model.load_state_dict(saved['model'])
+        inputs = RegionDataset(cache, rows, coordinates, quality, blank_labels, resolution=resolution)
+        p, _ = predict(model, DataLoader(inputs, batch_size=args.batch, pin_memory=True))
+        eligible, reflected = predict_reflections(model, cache, rows, coordinates, quality, blank_labels,
+                                                   resolution, args.batch)
+        p[eligible] = .5 * (p[eligible] + reflected)
+        predictions[rows] = p
+        coverage[str(fold)] = int(eligible.sum())
+        submission(cache.studies[rows], p).to_csv(cached, index=False)
+        write_json(note, {'plan_sha256': plan_sha, 'prediction_sha256': checksum(cached),
+                          'reflected': coverage[str(fold)]})
+        print(f'Fold {fold}: scored {len(rows)} held-out studies with {name} crops', flush=True)
+        del model
+        torch.cuda.empty_cache()
+    return predictions, coverage
 
 
 def evaluate(args: argparse.Namespace) -> None:
@@ -59,40 +98,7 @@ def evaluate(args: argparse.Namespace) -> None:
     write_json(stamp, plan)
     plan_sha = checksum(stamp)
 
-    blank_labels = np.full(baseline.shape[:2], -1, dtype=np.int64)
-    zoom = np.empty_like(baseline)
-    coverage = {}
-    for fold in range(5):
-        rows = np.flatnonzero(folds == fold)
-        cached = args.output / f'fold-{fold}-zoom-oof.csv'
-        note = cached.with_suffix('.json')
-        if note.exists():
-            saved = read_json(note)
-            if saved['plan_sha256'] != plan_sha or saved['prediction_sha256'] != checksum(cached):
-                raise ValueError('Cached zoom predictions belong to another comparison')
-            zoom[rows] = read_submission(cached, cache.studies[rows])
-            coverage[str(fold)] = saved['reflected']
-            print(f'Reusing measured zoom views for fold {fold}', flush=True)
-            continue
-        coordinates, quality = _load_fold(args.regions / f'fold-{fold}.npz', cache, folds, fold)
-        coordinates = smaller_field(coordinates)
-        resolution = files[str(fold)]['resolution']
-        saved = torch.load(args.runs / f'fold-{fold}' / 'final.pt', map_location='cpu', weights_only=True)
-        model = SpineClassifier(pretrained=False, spatial_detail=True).cuda()
-        model.load_state_dict(saved['model'])
-        inputs = RegionDataset(cache, rows, coordinates, quality, blank_labels, resolution=resolution)
-        p, _ = predict(model, DataLoader(inputs, batch_size=args.batch, pin_memory=True))
-        eligible, reflected = predict_reflections(model, cache, rows, coordinates, quality, blank_labels,
-                                                   resolution, args.batch)
-        p[eligible] = .5 * (p[eligible] + reflected)
-        zoom[rows] = p
-        coverage[str(fold)] = int(eligible.sum())
-        submission(cache.studies[rows], p).to_csv(cached, index=False)
-        write_json(note, {'plan_sha256': plan_sha, 'prediction_sha256': checksum(cached),
-                          'reflected': coverage[str(fold)]})
-        print(f'Fold {fold}: scored {len(rows)} held-out studies at the narrower field', flush=True)
-        del model
-        torch.cuda.empty_cache()
+    zoom, coverage = score_crop_pass(args, cache, folds, files, baseline.shape, plan_sha, smaller_field, 'zoom')
 
     truth = read_targets(args.root, cache.studies)
     result = blend_lateral(baseline, reference, zoom)

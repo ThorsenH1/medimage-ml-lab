@@ -18,7 +18,8 @@ from medimage.common import checksum, read_json, write_json
 from medimage.radiography_data import read_image
 
 KINDS = ('mass', 'calc')
-METRICS = ('peak_overlap', 'tissue_center_overlap', 'uniform_tissue_expectation')
+METRICS = ('peak_overlap', 'tissue_center_overlap', 'uniform_tissue_expectation',
+           'top_3_overlap', 'top_3_uniform_expectation', 'top_5_overlap', 'top_5_uniform_expectation')
 
 
 def test_masks(root: Path, test_views: set[str], recover: bool = False) -> tuple[dict, dict, dict]:
@@ -84,19 +85,67 @@ def plausible_unlabeled_mask(pixels: np.ndarray, expected_shape: tuple[int, int]
     return extreme > .99 * pixels.size and 2e-7 <= foreground <= .25
 
 
-def grid_evidence(maps: np.ndarray, pixels: np.ndarray, mask: np.ndarray) -> np.ndarray:
+def grid_points(maps: np.ndarray, pixels: np.ndarray) -> tuple:
     evidence = maps.max(axis=0)
     if not np.isfinite(evidence).all():
         raise ValueError('Invalid lesion-head score')
     size = evidence.shape[::-1]
     tissue = cv2.resize((pixels > 0).astype(np.float32), size, interpolation=cv2.INTER_AREA) >= .25
-    visible = cv2.resize(mask.astype(np.float32), size, interpolation=cv2.INTER_AREA) > 0
     indices = np.argwhere(tissue)
     if not len(indices):
         raise ValueError('No tissue cells in a mapped test projection')
     center = tuple(indices[np.square(indices - indices.mean(axis=0)).sum(axis=1).argmin()])
-    peak = np.unravel_index(np.where(tissue, evidence, -np.inf).argmax(), evidence.shape)
-    return np.array([visible[peak], visible[center], visible[tissue].mean()], dtype=np.float64)
+    top = indices[np.argsort(-evidence[tissue], kind='stable')[:5]]
+    return tissue, center, top
+
+
+def grid_evidence(points: tuple, mask: np.ndarray) -> np.ndarray:
+    tissue, center, top = points
+    visible = cv2.resize(mask.astype(np.float32), tissue.shape[::-1], interpolation=cv2.INTER_AREA) > 0
+    count = int(tissue.sum())
+    hits = int((tissue & visible).sum())
+    reached = visible[top[:, 0], top[:, 1]]
+    values = [reached[0], visible[center], hits / count]
+    for size in (3, 5):
+        draw = np.arange(min(size, count))
+        uniform = 1 - np.prod((count - hits - draw).clip(min=0) / (count - draw))
+        values.extend((reached[:size].any(), uniform))
+    return np.asarray(values, dtype=np.float64)
+
+
+def gallery(examples: dict, output: Path) -> None:
+    from matplotlib.patches import Rectangle
+
+    from medimage.portfolio_figures import plt, write_figure
+
+    fig, axes = plt.subplots(4, 3, figsize=(10.1, 13.7), layout='constrained')
+    fig.suptitle('Did the highest-scoring cell find the annotated cluster or mass?', x=.035,
+                 ha='left', fontsize=15, fontweight='bold')
+    for row, (kind, matched) in enumerate((kind, matched) for kind in KINDS for matched in (True, False)):
+        pixels, mask, grid_shape, (peak_y, peak_x), view = examples[kind, matched]
+        height, width = pixels.shape
+        scale_x, scale_y = width / grid_shape[1], height / grid_shape[0]
+        left, top = scale_x * peak_x - .5, scale_y * peak_y - .5
+        y, x = np.nonzero(mask)
+        windows = (None, (x.min(), y.min(), x.max(), y.max()), (left, top, left + scale_x, top + scale_y))
+        name = 'Mass' if kind == 'mass' else 'Calcifications'
+        outcome = 'overlap' if matched else 'miss'
+        titles = (f'{name} · {outcome} · {view}', 'Dataset mask, zoomed in', 'Model cell, zoomed in')
+        for axis, bounds, title in zip(axes[row], windows, titles, strict=True):
+            axis.imshow(pixels, cmap='gray', vmin=0, vmax=255)
+            axis.contour(mask, [.5], colors='#ffce52', linewidths=.9)
+            axis.add_patch(Rectangle((left, top), scale_x, scale_y, fill=False,
+                                     edgecolor='#54e4d0', linewidth=1.8))
+            if bounds is not None:
+                x0, y0, x1, y1 = bounds
+                radius = max(74, .85 * max(x1 - x0, y1 - y0))
+                cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+                axis.set_xlim(cx - radius, cx + radius)
+                axis.set_ylim(cy + radius, cy - radius)
+            axis.set_title(title, loc='left', fontsize=10)
+            axis.set_axis_off()
+    fig.supxlabel('Gold outline = dataset mask    Turquoise square = the model’s top cell', fontsize=10)
+    write_figure(fig, output)
 
 
 def averages(rows: list, repeats: int) -> dict:
@@ -133,7 +182,7 @@ def evaluate(args: argparse.Namespace) -> None:
     references, mapping, input_hashes = test_masks(args.root, test_views, args.recover_unlabeled_masks)
     model, _ = load_component(args.work, candidate, args.weights, args.clip)
     canvas = arrays['pixels'].shape[-2:]
-    observations, skipped = defaultdict(list), Counter()
+    observations, skipped, examples = defaultdict(list), Counter(), {}
 
     def align(item):
         slot, view, path = item
@@ -171,11 +220,17 @@ def evaluate(args: argparse.Namespace) -> None:
                 if not np.array_equal(pixels, arrays['pixels'][rows[slot], view]):
                     raise ValueError('The audit geometry does not reproduce the frozen input')
                 patient = batch.iloc[slot].patient
-                if union.any():
-                    observations['all'].append((patient, grid_evidence(maps[slot, view], pixels, union.any(axis=0))))
+                if not union.any():
+                    continue
+                points = grid_points(maps[slot, view], pixels)
+                observations['all'].append((patient, grid_evidence(points, union.any(axis=0))))
                 for kind, region in zip(KINDS, union, strict=True):
                     if region.any():
-                        observations[kind].append((patient, grid_evidence(maps[slot, view], pixels, region)))
+                        evidence = grid_evidence(points, region)
+                        observations[kind].append((patient, evidence))
+                        chosen = kind, bool(evidence[0])
+                        if args.local_gallery and chosen not in examples:
+                            examples[chosen] = (pixels, region, points[0].shape, points[2][0], ('CC', 'MLO')[view])
             if (start // args.batch + 1) % 25 == 0:
                 print(f'Processed {min(start + args.batch, len(positions))} of {len(positions)} test breasts', flush=True)
     if not all(observations[key] for key in ('all', *KINDS)):
@@ -185,9 +240,15 @@ def evaluate(args: argparse.Namespace) -> None:
               'mask_alignment_checks': dict(skipped), 'bootstrap_repeats': args.bootstrap,
               'include_unlabeled_masks': args.recover_unlabeled_masks,
               'method': ('Maximum raw logit across all four lesion channels, choosing one cell with at least 25% tissue. '
-                         'Any aligned mask pixel in that cell counts as an overlap. No flip pooling.'),
+                         'Any aligned mask pixel in that cell counts as an overlap. No flip pooling. '
+                         'Top-three and top-five figures allow a match in any ranked cell; uniform expectations '
+                         'draw that many different cells at random.'),
               'results': {key: averages(rows, args.bootstrap) for key, rows in observations.items()}}
     write_json(args.output, report)
+    if args.local_gallery:
+        if len(examples) != 4:
+            raise ValueError('The local gallery requires an overlap and a miss for each lesion type')
+        gallery(examples, args.output.with_name('local-peak-gallery.png'))
     print(report['results'], flush=True)
 
 
@@ -199,6 +260,8 @@ def main() -> None:
     parser.add_argument('--component', default='view-supervised')
     parser.add_argument('--recover-unlabeled-masks', action='store_true',
                         help='Check full-size, near-binary files in the official calcification mask series')
+    parser.add_argument('--local-gallery', action='store_true',
+                        help='Draw four actual held-out projections beside the local report')
     parser.add_argument('--batch', type=int, default=4)
     parser.add_argument('--workers', type=int, default=3)
     parser.add_argument('--bootstrap', type=int, default=1000)
