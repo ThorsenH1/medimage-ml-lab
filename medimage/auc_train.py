@@ -49,6 +49,10 @@ def new_model(config: dict, weights: Path, *, initialize: bool = False):
             return ChestBioViL(config['depth'], config['dropout'], weights if initialize else None)
         if config['backbone'] == 'convnext-chest':
             return ChestConvNeXt(config['depth'], config['dropout'], weights if initialize else None)
+        if config['backbone'] == 'cxr-clip-swin':
+            from medimage.chest_cxr_clip import ChestCxrClip
+
+            return ChestCxrClip(config['depth'], config['dropout'], weights if initialize else None)
         return ChestDense(config['backbone'], config['depth'], weights if initialize else None)
     return MammographySpatial(config['backbone'], config['resolution'], weights,
                               config['depth'], config['dropout'], config.get('pyramid', False),
@@ -300,7 +304,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description='Train high-resolution models on the locked radiography cohorts')
     parser.add_argument('task', choices=('chest', 'mammo'))
     parser.add_argument('--backbone', required=True,
-                        choices=('chex', 'imagenet', 'chest-reference', 'biovil-t', 'convnext-chest',
+                        choices=('chex', 'imagenet', 'chest-reference', 'biovil-t', 'convnext-chest', 'cxr-clip-swin',
                                  'effb0', 'effb3', 'r18', 'r50',
                                  'mammo-clip', 'mammo-clip-rsna'))
     for name in ('cohort', 'pixels', 'weights', 'output'):
@@ -329,13 +333,15 @@ def main() -> None:
     args = parser.parse_args()
     if min(args.batch, args.epochs, args.accumulate, args.depth) < 1 or args.focal_neg < 0:
         parser.error('Invalid training size or focal exponent')
-    chest_backbones = ('chex', 'imagenet', 'chest-reference', 'biovil-t', 'convnext-chest')
+    chest_backbones = ('chex', 'imagenet', 'chest-reference', 'biovil-t', 'convnext-chest', 'cxr-clip-swin')
     if (args.task == 'chest') != (args.backbone in chest_backbones):
         parser.error('Choose a backbone intended for this task')
     if args.backbone == 'biovil-t' and args.depth not in (1, 2):
         parser.error('BioViL-T can fine-tune one or two residual stages')
     if args.backbone == 'convnext-chest' and args.depth not in (1, 2, 3):
         parser.error('ConvNeXt can fine-tune up to three residual stages')
+    if args.backbone == 'cxr-clip-swin' and (args.resolution != 224 or args.depth not in (1, 2, 3)):
+        parser.error('Use 224-pixel CXR-CLIP inputs and fine-tune one to three Swin stages')
     if args.backbone == 'chest-reference' and args.parent is None:
         parser.error('Provide a trained chest reference checkpoint with --parent')
     if args.domain_parent and (args.task != 'mammo' or args.parent is None):

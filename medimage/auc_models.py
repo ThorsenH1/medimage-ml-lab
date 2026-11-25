@@ -74,6 +74,13 @@ def plain_metadata(*_):
     return {}
 
 
+def legacy_weight_metadata():
+    names = ('omegaconf.listconfig.ListConfig', 'omegaconf.dictconfig.DictConfig',
+             'omegaconf.nodes.AnyNode', 'omegaconf.base.ContainerMetadata', 'omegaconf.base.Metadata')
+    return [(UnusedConfiguration, name) for name in names] + [typing.Any, list, dict, int,
+                                                               (plain_metadata, 'collections.defaultdict')]
+
+
 def mammo_clip(weights: Path, expected_sha256: str) -> nn.Module:
     if checksum(weights) != expected_sha256:
         raise ValueError('Mammo-CLIP checkpoint differs from the documented source')
@@ -85,10 +92,7 @@ def mammo_clip(weights: Path, expected_sha256: str) -> nn.Module:
                    np.ndarray, np.dtype, np.dtypes.Float32DType, np.dtypes.Float64DType,
                    np.dtypes.Int32DType, np.dtypes.Int64DType]
     else:
-        metadata_classes = ('omegaconf.listconfig.ListConfig', 'omegaconf.dictconfig.DictConfig',
-                            'omegaconf.nodes.AnyNode', 'omegaconf.base.ContainerMetadata', 'omegaconf.base.Metadata')
-        allowed = [(UnusedConfiguration, name) for name in metadata_classes]
-        allowed += [typing.Any, list, dict, int, (plain_metadata, 'collections.defaultdict')]
+        allowed = legacy_weight_metadata()
     with torch.serialization.safe_globals(allowed):
         saved = torch.load(weights, map_location='cpu', weights_only=True, mmap=True)
     source = {name.removeprefix('image_encoder.'): value for name, value in saved['model'].items()

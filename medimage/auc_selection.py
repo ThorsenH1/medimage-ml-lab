@@ -379,13 +379,44 @@ def save_scores(destination: Path, **arrays) -> None:
         staging.unlink(missing_ok=True)
 
 
-def locked_component_scores(args, candidate, path, key, digest, rows, truth):
+def verified_component_scores(path, key, digest, rows, truth):
+    with np.load(path, allow_pickle=False) as existing:
+        if existing['selection_sha256'].item() != digest or existing['component'].item() != key:
+            raise ValueError('Cached component scores belong to another locked ensemble')
+    return read_scores(path, rows, num_labels=truth.shape[1], truth=truth, dtype=None)
+
+
+def reusable_components(directories, lock):
+    reusable = {}
+    for directory in directories:
+        selection = directory / 'selection.json'
+        source = read_json(selection)
+        if any(source[field] != lock[field] for field in ('task', 'manifest', 'labels')):
+            raise ValueError('Reusable components must come from the same frozen test cohort and label order')
+        source_digest = checksum(selection)
+        for index, key in enumerate(source['selected']['weights']):
+            if key == 'previous-locked':
+                continue
+            path = directory / 'component-predictions' / f'{index:03d}.npz'
+            if not path.is_file():
+                continue
+            for name in lock['selected']['weights']:
+                if name not in reusable and source['candidates'][key] == lock['candidates'][name]:
+                    reusable[name] = path, key, source_digest
+    return reusable
+
+
+def locked_component_scores(args, candidate, path, key, digest, rows, truth, prior=None):
     if path.exists():
-        with np.load(path, allow_pickle=False) as existing:
-            if existing['selection_sha256'].item() != digest or existing['component'].item() != key:
-                raise ValueError('Cached component scores belong to another locked ensemble')
-        values = read_scores(path, rows, num_labels=truth.shape[1], truth=truth, dtype=None)
+        values = verified_component_scores(path, key, digest, rows, truth)
         print(f'Reusing completed component {key} on {len(rows)} official test examples', flush=True)
+        return values
+    if prior is not None:
+        source, source_key, source_digest = prior
+        values = verified_component_scores(source, source_key, source_digest, rows, truth)
+        save_scores(path, rows=rows, labels=truth, logits=values, selection_sha256=digest, component=key,
+                    reused_from_selection=source_digest, reused_from_component=source_key)
+        print(f'Reused identical component {key} from another lock on {len(rows)} test examples', flush=True)
         return values
     print(f'Scoring locked component {key} on {len(rows)} official test examples', flush=True)
     values = test_component(args, candidate, rows)
@@ -406,6 +437,7 @@ def heldout_probabilities(args, lock, digest, rows, labels, truth, reference):
                     raise ValueError('Cached test scores belong to a different locked ensemble')
                 return read_scores(destination, rows, num_labels=len(labels), truth=truth, key='probabilities')
     selected = lock['selected']
+    reusable = reusable_components(getattr(args, 'reuse_components', ()), lock)
     scores = {}
     for index, key in enumerate(selected['weights']):
         if key == 'previous-locked':
@@ -413,7 +445,7 @@ def heldout_probabilities(args, lock, digest, rows, labels, truth, reference):
         else:
             checkpoint = args.output / 'component-predictions' / f'{index:03d}.npz'
             scores[key] = locked_component_scores(args, lock['candidates'][key], checkpoint,
-                                                  key, digest, rows, truth)
+                                                  key, digest, rows, truth, reusable.get(key))
         torch.cuda.empty_cache()
     logits = selected_scores(selected, scores, lock['component_calibration'])
     parameters = np.asarray(lock['ensemble_calibration'])
@@ -475,6 +507,8 @@ def main():
     parser.add_argument('--stable-blend', action='store_true', help='Compare group-fold aggregation of small blends')
     parser.add_argument('--crossfit-only', action='store_true', help='Select among nested group cross-fit blend candidates')
     parser.add_argument('--bootstrap', type=int, default=1000)
+    parser.add_argument('--reuse-components', type=Path, action='append', default=[],
+                        help='Reuse identical frozen component scores from another official test directory')
     args = parser.parse_args()
     if args.phase == 'lock':
         with threadpool_limits(limits=2):

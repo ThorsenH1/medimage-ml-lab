@@ -16,18 +16,26 @@ from medimage.spine_data import SEVERITIES, TARGETS, prepare
 from medimage.spine_heatmap import DiscHeatmap, anchor_inputs, observed_landmarks
 from medimage.spine_heatmap_crossfit import anatomy_offsets, predict_heatmaps
 from medimage.spine_localize import SpineCache, inference_regions, make_regions, read_folds
-from medimage.spine_metrics import read_submission, submission
+from medimage.spine_metrics import SAMPLE_WEIGHTS, read_submission, submission
 from medimage.spine_model import ROI_SIZE, SpineClassifier
 from medimage.spine_train import RegionDataset, predict
 
 LATERAL = slice(5, 25)
 FIELD_FRACTION = .80
 ZOOM_BLEND = .25
+GRADE_WEIGHT_EXPONENT = .5
 
 
 def smaller_field(coordinates: np.ndarray) -> np.ndarray:
     revised = coordinates.copy()
     revised[:, LATERAL, :, 3:5] *= FIELD_FRACTION
+    return revised
+
+
+def adjust_lateral_grades(probabilities: np.ndarray) -> np.ndarray:
+    revised = probabilities.copy()
+    lateral = probabilities[:, LATERAL].clip(min=0) / (SAMPLE_WEIGHTS ** GRADE_WEIGHT_EXPONENT)
+    revised[:, LATERAL] = lateral / lateral.sum(axis=-1, keepdims=True)
     return revised
 
 
@@ -130,6 +138,18 @@ def lock(args):
     if args.zoom_report:
         sampling['lateral_zoom'] = zoom_settings(args.zoom_report, args.laterality_report, sampling['laterality'],
                                                 comparison, fold_hash, grading_digest, fold_files)
+    if args.grade_weight_report:
+        tested = read_json(args.grade_weight_report)
+        zoom_metrics = read_json(args.zoom_report / 'metrics.json')['zoom_blend']
+        if (tested['selected_sha256'] != checksum(args.zoom_report / 'blend-oof.csv')
+                or tested['training_grade_weights'] != SAMPLE_WEIGHTS.tolist()
+                or tested['inverse_weight_exponent'] != GRADE_WEIGHT_EXPONENT
+                or not np.isclose(tested['baseline']['macro_auroc'], zoom_metrics['macro_auroc'], rtol=0, atol=1e-10)
+                or not tested['partially_corrected_lateral']['macro_auroc'] > zoom_metrics['macro_auroc']):
+            raise ValueError('The grade-weight audit does not match the measured narrow-crop grader')
+        sampling['grade_weight_correction'] = {'training_weights': SAMPLE_WEIGHTS.tolist(),
+                                               'exponent': GRADE_WEIGHT_EXPONENT,
+                                               'metrics_sha256': checksum(args.grade_weight_report)}
     write_json(args.output, {'reference_fraction': .5, 'folds_sha256': fold_hash,
                              'comparison_sha256': checksum(args.comparison),
                              'reference_selection_sha256': checksum(args.reference_selection),
@@ -182,6 +202,10 @@ def infer(args):
     zoom = plan.get('lateral_zoom')
     if zoom and (not reflection or zoom['field_fraction'] != FIELD_FRACTION or zoom['zoom_fraction'] != ZOOM_BLEND):
         raise ValueError('MRI zoom differs from the fixed inference recipe')
+    grade_correction = plan.get('grade_weight_correction')
+    if grade_correction and (not zoom or grade_correction['training_weights'] != SAMPLE_WEIGHTS.tolist()
+                             or grade_correction['exponent'] != GRADE_WEIGHT_EXPONENT):
+        raise ValueError('MRI grade weight adjustment differs from the fixed inference recipe')
     prepare(args.root, args.cache, 'test', 4)
     cache = SpineCache.load(args.cache)
     grading_cache = native_inference_cache(args.root, cache, args.native_cache, plan) if args.native_cache else cache
@@ -246,7 +270,8 @@ def infer(args):
             if zoom:
                 first_regions['lateral_zoom_coordinates'] = narrow[:, LATERAL].tolist()
         del model
-    model_probabilities = np.mean(folds, axis=0, dtype=np.float64)
+    fold_average = np.mean(folds, axis=0, dtype=np.float64)
+    model_probabilities = adjust_lateral_grades(fold_average) if grade_correction else fold_average
     fraction = plan['reference_fraction']
     blended = fraction * reference + (1 - fraction) * model_probabilities
     desired = pd.read_csv(args.root / 'sample_submission.csv')
@@ -263,6 +288,8 @@ def infer(args):
         report['selected'] += ' with left-right reflection'
     if zoom:
         report['selected'] += ' and narrower lateral crops'
+    if grade_correction:
+        report['selected'] += ' and partial grade weight adjustment'
     write_json(args.output.with_suffix('.json'), report)
     if args.trace:
         write_json(args.trace, {'task': 'spine', 'selection_sha256': digest, 'studies': cache.studies.tolist(),
@@ -271,7 +298,9 @@ def infer(args):
                                 'folds': list(range(5)), 'fold_probabilities': np.asarray(folds).tolist(),
                                 'blended_probabilities': blended.tolist(), 'first_fold_regions': first_regions,
                                 **({'reflection': reflection_trace} if reflection else {}),
-                                **({'lateral_zoom': {**zoom, 'folds': zoom_trace}} if zoom else {})})
+                                **({'lateral_zoom': {**zoom, 'folds': zoom_trace}} if zoom else {}),
+                                **({'grade_weight_correction': grade_correction,
+                                    'uncorrected_model_probabilities': fold_average.tolist()} if grade_correction else {})})
     print(f"Verified {len(result)} prediction rows from the locked MRI ensemble.", flush=True)
 
 
@@ -287,6 +316,7 @@ def main():
     build.add_argument('--native-regions', type=Path)
     build.add_argument('--laterality-report', type=Path)
     build.add_argument('--zoom-report', type=Path)
+    build.add_argument('--grade-weight-report', type=Path)
     for name in (*shared, 'plan', 'root', 'cache', 'prior'):
         run.add_argument(f'--{name}', type=Path, required=True)
     run.add_argument('--batch', type=int, default=8)
@@ -298,6 +328,8 @@ def main():
             parser.error('Provide the native training cache and native regions together')
         if args.zoom_report and not args.laterality_report:
             parser.error('A zoom report requires the corresponding laterality report')
+        if args.grade_weight_report and not args.zoom_report:
+            parser.error('A grade-weight report requires the corresponding zoom report')
         lock(args)
     else:
         if args.batch < 1:

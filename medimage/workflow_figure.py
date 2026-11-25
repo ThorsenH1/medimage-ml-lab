@@ -110,7 +110,13 @@ def mri(examples: Path, cache_path: Path, trace: dict, output: Path) -> None:
     reference = np.asarray(trace['reference_probabilities'])
     model = np.asarray(trace['new_model_probabilities'])
     blended = np.asarray(trace['blended_probabilities'])
-    np.testing.assert_allclose(fold_predictions.mean(axis=0), model, atol=1e-8)
+    average = fold_predictions.mean(axis=0)
+    if trace.get('grade_weight_correction'):
+        from medimage.spine_detail_infer import adjust_lateral_grades
+
+        np.testing.assert_allclose(average, trace['uncorrected_model_probabilities'], atol=1e-8)
+        average = adjust_lateral_grades(average)
+    np.testing.assert_allclose(average, model, atol=1e-8)
     np.testing.assert_allclose(trace['reference_fraction'] * reference + trace['new_model_fraction'] * model,
                                blended, atol=1e-8)
     target = trace['targets'].index('spinal_canal_stenosis_l4_l5')
