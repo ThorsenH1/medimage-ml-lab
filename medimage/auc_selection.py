@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 from itertools import combinations
 from pathlib import Path
+from tempfile import mkstemp
 
 import numpy as np
 from scipy.optimize import minimize
@@ -24,7 +26,7 @@ def checked(root: Path, relative: str, digest: str | None = None) -> Path:
     return location
 
 
-def read_scores(path: Path, rows, *, num_labels: int, truth=None, key='logits'):
+def read_scores(path: Path, rows, *, num_labels: int, truth=None, key='logits', dtype=np.float64):
     with np.load(path, allow_pickle=False) as data:
         values = data[key]
         if not np.array_equal(data['rows'], rows) or values.shape != (len(rows), num_labels):
@@ -33,7 +35,7 @@ def read_scores(path: Path, rows, *, num_labels: int, truth=None, key='logits'):
             raise ValueError('Previous test labels differ from the frozen cohort')
         if not np.isfinite(values).all():
             raise ValueError('Nonfinite predictions')
-        return values.astype(np.float64, copy=False)
+        return values if dtype is None else values.astype(dtype, copy=False)
 
 
 def previous_validation(args, plan, rows, count):
@@ -359,6 +361,34 @@ def prediction_examples(task, frame, rows, truth, probabilities, thresholds, lab
     return examples
 
 
+def save_scores(destination: Path, **arrays) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, filename = mkstemp(dir=destination.parent, prefix='.scoring-', suffix='.npz')
+    staging = Path(filename)
+    try:
+        with os.fdopen(descriptor, 'wb') as output:
+            np.savez_compressed(output, **arrays)
+        staging.replace(destination)
+    finally:
+        staging.unlink(missing_ok=True)
+
+
+def locked_component_scores(args, candidate, path, key, digest, rows, truth):
+    if path.exists():
+        with np.load(path, allow_pickle=False) as existing:
+            if existing['selection_sha256'].item() != digest or existing['component'].item() != key:
+                raise ValueError('Cached component scores belong to another locked ensemble')
+        values = read_scores(path, rows, num_labels=truth.shape[1], truth=truth, dtype=None)
+        print(f'Reusing completed component {key} on {len(rows)} official test examples', flush=True)
+        return values
+    print(f'Scoring locked component {key} on {len(rows)} official test examples', flush=True)
+    values = test_component(args, candidate, rows)
+    if values.shape != truth.shape or not np.isfinite(values).all():
+        raise ValueError('Scored component does not match the locked test labels')
+    save_scores(path, rows=rows, labels=truth, logits=values, selection_sha256=digest, component=key)
+    return values
+
+
 def heldout_probabilities(args, lock, digest, rows, labels, truth, reference):
     import torch
 
@@ -371,20 +401,19 @@ def heldout_probabilities(args, lock, digest, rows, labels, truth, reference):
                 return read_scores(destination, rows, num_labels=len(labels), truth=truth, key='probabilities')
     selected = lock['selected']
     scores = {}
-    for key in selected['weights']:
-        print(f'Scoring locked component {key} on {len(rows)} official test examples', flush=True)
+    for index, key in enumerate(selected['weights']):
         if key == 'previous-locked':
             scores[key] = read_scores(reference / 'test-predictions.npz', rows, num_labels=len(labels), truth=truth)
         else:
-            scores[key] = test_component(args, lock['candidates'][key], rows)
+            checkpoint = args.output / 'component-predictions' / f'{index:03d}.npz'
+            scores[key] = locked_component_scores(args, lock['candidates'][key], checkpoint,
+                                                  key, digest, rows, truth)
         torch.cuda.empty_cache()
     logits = selected_scores(selected, scores, lock['component_calibration'])
     parameters = np.asarray(lock['ensemble_calibration'])
     probabilities = expit(logits * parameters[:, 0] + parameters[:, 1])
-    temporary = args.output / 'test-predictions.partial.npz'
-    np.savez_compressed(temporary, rows=rows, labels=truth, probabilities=probabilities,
-                        logits=logits, selection_sha256=digest)
-    temporary.replace(destination)
+    save_scores(destination, rows=rows, labels=truth, probabilities=probabilities,
+                logits=logits, selection_sha256=digest)
     return probabilities
 
 
