@@ -13,6 +13,7 @@ from medimage.auc_predict import arrays_for
 from medimage.auc_selection import component_logits, load_component
 from medimage.common import checksum, read_json, write_json
 from medimage.demo import mammography_phantom, save_png, xray_phantom
+from medimage.mammo_native import PIXEL_FORMAT
 from medimage.portfolio_figures import plt, write_figure
 from medimage.radiography_data import read_image
 
@@ -39,12 +40,13 @@ def patch_grid(image: np.ndarray, task: str) -> list[tuple[int, int, int, int]]:
     window_h = max(2, round(height / (ny + 1) * 1.25))
     window_w = max(2, round(width / (nx + 1) * 1.25))
     support = cv2.GaussianBlur(image, (0, 0), max(1, min(height, width) / 90))
+    black = np.iinfo(image.dtype).max * (8 / 255)
     result = []
     for cy in np.linspace(window_h // 2, height - window_h // 2, ny).astype(int).tolist():
         for cx in np.linspace(window_w // 2, width - window_w // 2, nx).astype(int).tolist():
             left, top = max(0, cx - window_w // 2), max(0, cy - window_h // 2)
             right, bottom = min(width, left + window_w), min(height, top + window_h)
-            if (support[top:bottom, left:right] > 8).mean() >= .28:
+            if (support[top:bottom, left:right] > black).mean() >= .28:
                 result.append((left, top, right, bottom))
     return result
 
@@ -58,13 +60,13 @@ def soften(image: np.ndarray, boxes: list[tuple[int, int, int, int]]) -> list[np
         weight = np.outer(vertical, horizontal)
         out = image.copy()
         view = np.s_[top:bottom, left:right]
-        out[view] = np.rint(image[view] * (1 - weight) + smooth[view] * weight).astype(np.uint8)
+        out[view] = np.rint(image[view] * (1 - weight) + smooth[view] * weight).astype(image.dtype)
         changed.append(out)
     return changed
 
 
 def impact_overlay(axis, model_input, scores):
-    axis.imshow(model_input, cmap='gray', vmin=0, vmax=255)
+    axis.imshow(model_input, cmap='gray', vmin=0, vmax=np.iinfo(model_input.dtype).max)
     impact = np.zeros(model_input.shape, dtype=np.float32)
     overlap = np.zeros_like(impact)
     for row in scores:
@@ -106,11 +108,12 @@ def single_figure(label, pixels, scores, output):
     fig.suptitle(f'What changed the {label} model score?', x=.02, ha='left', fontsize=17, fontweight='bold')
     strongest = max(scores, key=lambda row: abs(row['score_drop']))
     left, top, right, bottom = strongest['box_xyxy']
-    cells[0].imshow(pixels, cmap='gray', vmin=0, vmax=255)
+    gray = dict(cmap='gray', vmin=0, vmax=np.iinfo(pixels.dtype).max)
+    cells[0].imshow(pixels, **gray)
     cells[0].add_patch(Rectangle((left, top), right - left, bottom - top, fill=False,
                                  edgecolor='#40dfc5', linewidth=1.6))
     cells[0].set_title('Processed model input', fontsize=10)
-    cells[1].imshow(pixels[top:bottom, left:right], cmap='gray', vmin=0, vmax=255)
+    cells[1].imshow(pixels[top:bottom, left:right], **gray)
     cells[1].set_title('Zoom of the strongest response', fontsize=10)
     impact_overlay(cells[2], pixels, scores)
     cells[2].set_title('Blur one region at a time', fontsize=10)
@@ -131,6 +134,9 @@ def explain(args) -> None:
         raise ValueError('Choose a single image-consuming model component')
     args.output.mkdir(parents=True, exist_ok=True)
     real = any((args.image, args.cc, args.mlo))
+    pixel_format = entry['config'].get('pixel_format')
+    if pixel_format == PIXEL_FORMAT and not real:
+        raise ValueError('Supply at least one local DICOM projection for the native component')
     view_index = 0
     if real and task == 'chest':
         if args.image is None or args.cc or args.mlo:
@@ -139,7 +145,7 @@ def explain(args) -> None:
     elif real:
         if args.image or not (args.cc or args.mlo):
             raise ValueError('Mammography takes --cc and/or --mlo')
-        after_args = argparse.Namespace(cc=args.cc, mlo=args.mlo)
+        after_args = argparse.Namespace(cc=args.cc, mlo=args.mlo, native_cc=args.cc, native_mlo=args.mlo)
         view_index = int(args.cc is None)
     elif task == 'chest':
         xray_phantom(args.output)
@@ -161,7 +167,7 @@ def explain(args) -> None:
             after_args = argparse.Namespace(cc=input_path, mlo=paired)
         before = arrays_for(task, entry['image_shape'], before_args)
     plane = (0,) if task == 'chest' else (0, view_index)
-    after = arrays_for(task, entry['image_shape'], after_args)
+    after = arrays_for(task, entry['image_shape'], after_args, pixel_format)
     pixels = after['pixels'][plane]
     boxes = patch_grid(pixels, task)
     if not boxes:

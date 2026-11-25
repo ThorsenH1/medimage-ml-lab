@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from medimage.auc_models import (ChestBioViL, ChestConvNeXt, ChestDense, ChestReference, MammographySpatial,
                                  align_augmentation, spatial_loss)
 from medimage.common import checksum, read_json, write_json
+from medimage.mammo_native import PIXEL_FORMAT
 from medimage.radiography_data import CHEST_LABELS
 from medimage.radiography_train import save_checkpoint, validation_metrics
 from medimage.search_features import load_manifest
@@ -29,6 +30,10 @@ def store(task: str, cohort: Path, path: Path):
     if any(len(value) != len(frame) for value in arrays.values()):
         raise ValueError('Pixel arrays differ from cohort size')
     if task == 'mammo':
+        pixel_format = signature['config'].get('pixel_format')
+        dtype = np.uint16 if pixel_format == PIXEL_FORMAT else np.uint8
+        if pixel_format not in (None, PIXEL_FORMAT) or arrays['pixels'].dtype != dtype:
+            raise ValueError('Unexpected mammography storage precision')
         if not np.array_equal(arrays['views'], frame[['CC', 'MLO']].ne('').to_numpy()):
             raise ValueError('Cached mammography views disagree with the manifest')
         if arrays['annotation_available'][frame.split.ne('train').to_numpy()].any():
@@ -89,7 +94,10 @@ def training_batches(pixels, training, rng, block, batch):
 
 
 def transfer(array, rows):
-    return torch.from_numpy(np.ascontiguousarray(array[rows])).to('cuda', non_blocking=True)
+    selected = np.ascontiguousarray(array[rows])
+    if selected.dtype == np.uint16:
+        selected = np.multiply(selected, np.float32(1. / 257.), dtype=np.float32)
+    return torch.from_numpy(selected).to('cuda', non_blocking=True)
 
 
 def infer_batch(model, task, arrays, rows, tta):
@@ -144,6 +152,8 @@ def fit(args) -> None:
         'lr', 'head_lr', 'class_power', 'auxiliary', 'dropout', 'tta', 'focal_neg')}
     config.update(manifest=audit['manifest_sha256'], pixel_sha256=pixel_hash,
                   parent_sha256=checksum(args.parent) if args.parent else None)
+    if arrays['pixels'].dtype == np.uint16:
+        config['pixel_format'] = PIXEL_FORMAT
     for option in ('pyramid', 'affine', 'block', 'specialize', 'view_supervision'):
         if getattr(args, option):
             config[option] = getattr(args, option)
