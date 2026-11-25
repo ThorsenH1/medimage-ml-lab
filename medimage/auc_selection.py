@@ -90,21 +90,27 @@ def label_adaptive_candidate(truth, scores, calibrated, weights, folds, strength
             'metrics': validation_metrics(truth, out)}
 
 
-def fit_pairwise_weights(truth, matrix, strength):
+def fit_pairwise_weights(truth, matrix, strength, center=None, max_pairs=None, seed=8119):
     positive = truth[:, 0].astype(bool)
-    difference = (matrix[positive, None] - matrix[~positive][None]).reshape(-1, matrix.shape[1])
+    cases, controls = matrix[positive], matrix[~positive]
+    if max_pairs is not None and len(cases) * len(controls) > max_pairs:
+        random = np.random.default_rng(seed)
+        difference = (cases[random.integers(len(cases), size=max_pairs)]
+                      - controls[random.integers(len(controls), size=max_pairs)])
+    else:
+        difference = (cases[:, None] - controls[None]).reshape(-1, matrix.shape[1])
     if not len(difference):
-        raise ValueError('Pairwise fusion requires both breast-level classes')
-    uniform = np.full(matrix.shape[1], 1 / matrix.shape[1])
+        raise ValueError('Pairwise fusion requires both classes')
+    anchor = np.full(matrix.shape[1], 1 / matrix.shape[1]) if center is None else center
 
     def loss(weights):
         margin = difference @ weights
-        change = weights - uniform
+        change = weights - anchor
         value = np.logaddexp(0., -margin).mean() + strength * np.square(change).sum()
         gradient = -(difference.T @ expit(-margin)) / len(margin) + 2 * strength * change
         return value, gradient
 
-    result = minimize(loss, uniform, method='SLSQP', jac=True, bounds=[(0., 1.)] * len(uniform),
+    result = minimize(loss, anchor, method='SLSQP', jac=True, bounds=[(0., 1.)] * len(anchor),
                       constraints={'type': 'eq', 'fun': lambda value: value.sum() - 1},
                       options={'ftol': 1e-9, 'maxiter': 100})
     if not result.success:
