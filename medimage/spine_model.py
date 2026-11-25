@@ -91,3 +91,17 @@ def severity_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     spinal_w = weight[:, :5].max(dim=1).values
     any_severe = F.binary_cross_entropy(spinal_p, spinal_y, weight=spinal_w, reduction='sum') / spinal_w.sum().clamp_min(1)
     return (sum(losses) + any_severe) / 4
+
+
+def lateral_ranking_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Rank each labeled grade above other grades at the same lateral target."""
+    scores = logits[:, 5:].float().log_softmax(dim=-1)
+    actual = labels[:, 5:]
+    known = actual >= 0
+    positive = actual[..., None] == torch.arange(3, device=actual.device)
+    negative = known[..., None] & ~positive
+    compared = positive[:, None] & negative[None]
+    difference = scores[:, None] - scores[None]
+    count = compared.sum(dim=(0, 1))
+    by_target = (F.softplus(-difference) * compared).sum(dim=(0, 1)) / count.clamp_min(1)
+    return by_target.sum() / (count > 0).sum().clamp_min(1)

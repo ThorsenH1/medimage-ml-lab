@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import cv2
@@ -10,9 +11,12 @@ import torch.nn.functional as F
 from sklearn.model_selection import StratifiedGroupKFold
 from torch import nn
 
+from medimage.auc_mammo_data import MAX_LESIONS
 from medimage.auc_patches import FINE_TEXTURE_SCALES, PATCH, SCALES, PatchNet, train_patch_epoch
+from medimage.auc_selection import save_scores
 from medimage.auc_train import store, transfer
-from medimage.common import checksum, read_json, write_json
+from medimage.common import checksum, write_json
+from medimage.mammo_native import PIXEL_FORMAT
 from medimage.radiography_train import save_checkpoint, validation_metrics
 
 
@@ -32,7 +36,7 @@ def patch_tokens(model, resized, coordinates):
 
 
 @torch.inference_mode()
-def extract(model: PatchNet, arrays, rows):
+def extract(model: PatchNet, arrays, rows, progress: str | None = None):
     model.eval()
     size = 19 if model.fine_texture else SIZE
     scales = FINE_TEXTURE_SCALES if model.fine_texture else SCALES
@@ -73,6 +77,8 @@ def extract(model: PatchNet, arrays, rows):
             take = list(dict.fromkeys(proposals))[:size - 1]
             bags[index, view, 1:1 + len(take)] = tokens[take].half().cpu().numpy()
             valid[index, view, 1:1 + len(take)] = True
+        if progress and (index + 1) % 64 == 0:
+            print(f'{progress}: {index + 1} / {len(rows)} breasts', flush=True)
     if not valid.any((1, 2)).all() or not np.isfinite(bags).all():
         raise ValueError('Each breast must produce finite proposals for an available view')
     return bags, valid
@@ -133,16 +139,27 @@ def predict(head, saved, arrays, rows, weights):
     return np.mean(scores, axis=0, dtype=np.float64)
 
 
-def train_detectors(args, frame, labels, arrays, development, validation, config):
+def read_native_boxes(path: Path, pixel_hash: str, manifest: str, training: np.ndarray, total: int) -> np.ndarray:
+    with np.load(path, allow_pickle=False) as contents:
+        signature = json.loads(contents['signature'].item())
+        boxes = contents['boxes']
+        if (signature['pixel_sha256'] != pixel_hash or signature['cohort_sha256'] != manifest
+                or contents['finished'].item() != len(training) or not np.array_equal(contents['rows'], training)
+                or boxes.shape != (total, 2, MAX_LESIONS, 5) or boxes.dtype != np.int16):
+            raise ValueError('The training box sidecar does not match this native cache and split')
+    return boxes
+
+
+def train_detectors(args, frame, labels, arrays, development, validation, config, boxes):
     splitter = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=args.seed)
     folds = list(splitter.split(development, labels[development, 0], frame.iloc[development].patient))
-    boxes = np.load(args.pixels / 'lesions.npy', mmap_mode='r', allow_pickle=False)
     if (boxes[frame.split.ne('train').to_numpy()] >= 0).any():
         raise ValueError('Only development rows can contribute lesion boxes')
     size = 19 if config.get('fine_texture') else SIZE
     oof = (np.zeros((len(development), 2, size, DIMENSIONS), np.float16),
            np.zeros((len(development), 2, size), bool))
     states, held_banks = [], []
+    feature_recipe = checksum(Path(__file__)) if config.get('pixel_format') else None
     for fold, (fit, check) in enumerate(folds):
         if set(frame.iloc[development[fit]].patient) & set(frame.iloc[development[check]].patient):
             raise ValueError('A patient straddles the proposal-training folds')
@@ -166,9 +183,28 @@ def train_detectors(args, frame, labels, arrays, development, validation, config
                 print(f'Detector {fold + 1} epoch {epoch + 1}: {progress}', flush=True)
             save_checkpoint(local, {'config': run, 'model': detector.state_dict()})
         states.append({name: parameter.cpu() for name, parameter in detector.state_dict().items()})
-        train_bag, train_mask = extract(detector, arrays, development[check])
+        bank_path = args.output / f'detector-{fold + 1}-proposals.npz'
+        detector_hash = checksum(local) if feature_recipe else None
+        if detector_hash and bank_path.exists():
+            with np.load(bank_path, allow_pickle=False) as bank:
+                if (bank['detector_sha256'].item() != detector_hash or bank['feature_recipe'].item() != feature_recipe
+                        or not np.array_equal(bank['development'], development[check])
+                        or not np.array_equal(bank['validation'], validation)):
+                    raise ValueError('Cached proposal features differ from the detector or patient split')
+                train_bag, train_mask = bank['train_bag'], bank['train_mask']
+                val_bag, val_mask = bank['val_bag'], bank['val_mask']
+        else:
+            train_bag, train_mask = extract(detector, arrays, development[check],
+                                            f'Detector {fold + 1} held-out training' if detector_hash else None)
+            val_bag, val_mask = extract(detector, arrays, validation,
+                                        f'Detector {fold + 1} validation' if detector_hash else None)
+            if detector_hash:
+                save_scores(bank_path, detector_sha256=detector_hash, feature_recipe=feature_recipe,
+                            development=development[check],
+                            validation=validation, train_bag=train_bag, train_mask=train_mask,
+                            val_bag=val_bag, val_mask=val_mask)
         oof[0][check], oof[1][check] = train_bag, train_mask
-        held_banks.append(extract(detector, arrays, validation))
+        held_banks.append((val_bag, val_mask))
         print(f'Detector {fold + 1}: extracted unseen training and validation proposals', flush=True)
         del detector
     return oof, held_banks, states
@@ -187,7 +223,15 @@ def fit(args):
               'pixel_sha256': pixel_hash, 'weight_sha256': PatchNet(args.weights).weight_sha256}
     if args.fine_texture:
         config['fine_texture'] = True
-    oof, banks, states = train_detectors(args, frame, labels, arrays, train, validation, config)
+    native = arrays['pixels'].dtype == np.uint16
+    if native != bool(args.native_boxes):
+        raise ValueError('Provide a native training box sidecar when using the 16-bit cache')
+    if native:
+        boxes = read_native_boxes(args.native_boxes, pixel_hash, config['manifest'], train, len(frame))
+        config.update(pixel_format=PIXEL_FORMAT, training_boxes_sha256=checksum(args.native_boxes))
+    else:
+        boxes = np.load(args.pixels / 'lesions.npy', mmap_mode='r', allow_pickle=False)
+    oof, banks, states = train_detectors(args, frame, labels, arrays, train, validation, config, boxes)
     best, history = (-1., -1.), []
     for i, (width, dropout, lr) in enumerate(RECIPES):
         torch.manual_seed(args.seed + 500 + i)
@@ -237,6 +281,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=15)
     parser.add_argument('--patch-epochs', type=int, default=7)
     parser.add_argument('--seed', type=int, default=4731)
+    parser.add_argument('--native-boxes', type=Path, help='Use verified training boxes aligned to the 16-bit cache')
     parser.add_argument('--fine-texture', action='store_true',
                         help='Use fine-scale contrast channels, smaller proposals and cross-view attention')
     args = parser.parse_args()

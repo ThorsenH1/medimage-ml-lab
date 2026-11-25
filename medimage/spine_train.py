@@ -15,7 +15,7 @@ from medimage.common import checksum, read_json, seed_everything, write_json
 from medimage.radiography_train import save_checkpoint
 from medimage.spine_localize import SpineCache, read_folds
 from medimage.spine_metrics import check_probabilities, read_targets, score, submission
-from medimage.spine_model import ROI_SIZE, SpineClassifier, crop_regions, severity_loss
+from medimage.spine_model import ROI_SIZE, SpineClassifier, crop_regions, lateral_ranking_loss, severity_loss
 
 
 class RegionDataset(Dataset):
@@ -112,6 +112,8 @@ def train(args: argparse.Namespace) -> None:
         config['spatial_detail'] = True
     if args.resolution != ROI_SIZE:
         config['resolution'] = args.resolution
+    if args.lateral_ranking_weight:
+        config['lateral_ranking_weight'] = args.lateral_ranking_weight
     model = SpineClassifier(pretrained=args.parent is None, spatial_detail=args.spatial_detail).cuda()
     if args.parent:
         warm = torch.load(args.parent, map_location='cpu', weights_only=True)
@@ -165,6 +167,8 @@ def train(args: argparse.Namespace) -> None:
             with torch.autocast('cuda', dtype=torch.float16):
                 logits = model(images, meta)
             loss = severity_loss(logits, target)
+            if args.lateral_ranking_weight:
+                loss = loss + args.lateral_ranking_weight * lateral_ranking_loss(logits, target)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 4.)
@@ -233,7 +237,12 @@ def main() -> None:
     parser.add_argument('--parent', type=Path, help='Warm start from a complete classifier for the same outer fold')
     parser.add_argument('--spatial-detail', action='store_true', help='Keep coarse spatial details in each ROI token')
     parser.add_argument('--resolution', type=int, choices=(96, 112, 128), default=ROI_SIZE)
-    train(parser.parse_args())
+    parser.add_argument('--lateral-ranking-weight', type=float, default=0.,
+                        help='Add a within-target ranking loss for the twenty side targets')
+    args = parser.parse_args()
+    if not 0. <= args.lateral_ranking_weight <= 1.:
+        parser.error('The lateral ranking weight must be between 0 and 1')
+    train(args)
 
 
 if __name__ == '__main__':

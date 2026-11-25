@@ -67,6 +67,7 @@ def crop(image, y, x, width):
 def training_patches(pixels, boxes, complete, rows, seed: int, repeats: int, fine_texture: bool = False):
     rng = np.random.default_rng(seed)
     patches, labels = [], []
+    tissue_threshold = 10 * (257 if pixels.dtype == np.uint16 else 1)
     for row in rows:
         for view in range(2):
             lesions = boxes[row, view][boxes[row, view, :, 0] >= 0]
@@ -94,7 +95,7 @@ def training_patches(pixels, boxes, complete, rows, seed: int, repeats: int, fin
                           & (y + radius >= top) & (y - radius <= bottom)):
                     continue
                 patch = crop(image, y, x, side)
-                if (patch > 10).mean() < .50:
+                if (patch > tissue_threshold).mean() < .50:
                     continue
                 patches.append(patch)
                 labels.append(0)
