@@ -11,8 +11,11 @@ from medimage.auc_mammo_data import Geometry
 from medimage.auc_mammo_mil import BreastMIL
 from medimage.auc_mammo_texture import TEXTURE_DIMENSIONS, breast_features
 from medimage.auc_predict import prediction_trace
-from medimage.auc_selection import cross_fit_calibration, fit_pairwise_weights, label_weights, read_scores, stable_candidate
+from medimage.auc_selection import (
+    cross_fit_calibration, fit_pairwise_differences, fit_pairwise_weights, label_weights, read_scores, stable_candidate,
+)
 from medimage.auc_train import ResidentPixels
+from medimage.mammo_rank_balance import ranking_pairs
 from medimage.radiography_evaluate import patient_bootstrap
 from medimage.spine_native import reproject_regions
 from medimage.visual_explain import patch_grid, soften
@@ -34,6 +37,20 @@ def test_pairwise_fusion_prefers_the_better_ranker_on_its_fit_rows():
     assert weights[0] > weights[1]
     assert np.all(weights >= 0)
     np.testing.assert_allclose(weights.sum(), 1.)
+
+
+def test_lesion_balanced_ranking_retains_global_pairs_and_equalizes_added_mass():
+    truth = np.array([1, 1, 1, 1, 0, 0, 0], dtype=bool)
+    types = np.array(['calc', 'calc', 'calc', 'mass', 'calc', 'calc', 'mass'])
+    logits = np.array([[1, -1], [2, 0], [0, 1], [2, -2], [0, 0], [0, 1], [1, 0]], dtype=float)
+    pairs, uniform = ranking_pairs(logits, truth, types, 0.)
+    same_pairs, balanced = ranking_pairs(logits, truth, types, .5)
+    np.testing.assert_array_equal(pairs, same_pairs)
+    np.testing.assert_allclose(balanced.sum(), 1.)
+    np.testing.assert_allclose((balanced - .5 * uniform).reshape(4, 3)[:3, :2].sum(), .25)
+    np.testing.assert_allclose((balanced - .5 * uniform).reshape(4, 3)[3, 2], .25)
+    np.testing.assert_allclose(fit_pairwise_differences(pairs, .12, pair_weights=uniform),
+                               fit_pairwise_weights(truth[:, None], logits, .12), atol=1e-10)
 
 
 def test_group_bagging_produces_normalized_model_weights():

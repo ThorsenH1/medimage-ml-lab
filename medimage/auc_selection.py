@@ -99,16 +99,26 @@ def fit_pairwise_weights(truth, matrix, strength, center=None, max_pairs=None, s
                       - controls[random.integers(len(controls), size=max_pairs)])
     else:
         difference = (cases[:, None] - controls[None]).reshape(-1, matrix.shape[1])
+    return fit_pairwise_differences(difference, strength, center)
+
+
+def fit_pairwise_differences(difference, strength, center=None, pair_weights=None):
     if not len(difference):
         raise ValueError('Pairwise fusion requires both classes')
-    anchor = np.full(matrix.shape[1], 1 / matrix.shape[1]) if center is None else center
+    anchor = np.full(difference.shape[1], 1 / difference.shape[1]) if center is None else center
 
     def loss(weights):
         margin = difference @ weights
         change = weights - anchor
-        value = np.logaddexp(0., -margin).mean() + strength * np.square(change).sum()
-        gradient = -(difference.T @ expit(-margin)) / len(margin) + 2 * strength * change
-        return value, gradient
+        errors = np.logaddexp(0., -margin)
+        derivatives = expit(-margin)
+        if pair_weights is None:
+            value = errors.mean()
+            gradient = -(difference.T @ derivatives) / len(margin)
+        else:
+            value = pair_weights @ errors
+            gradient = -(difference.T @ (pair_weights * derivatives))
+        return value + strength * np.square(change).sum(), gradient + 2 * strength * change
 
     result = minimize(loss, anchor, method='SLSQP', jac=True, bounds=[(0., 1.)] * len(anchor),
                       constraints={'type': 'eq', 'fun': lambda value: value.sum() - 1},
