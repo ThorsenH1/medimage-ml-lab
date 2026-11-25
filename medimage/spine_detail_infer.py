@@ -20,6 +20,16 @@ from medimage.spine_metrics import read_submission, submission
 from medimage.spine_model import ROI_SIZE, SpineClassifier
 from medimage.spine_train import RegionDataset, predict
 
+LATERAL = slice(5, 25)
+FIELD_FRACTION = .80
+ZOOM_BLEND = .25
+
+
+def smaller_field(coordinates: np.ndarray) -> np.ndarray:
+    revised = coordinates.copy()
+    revised[:, LATERAL, :, 3:5] *= FIELD_FRACTION
+    return revised
+
 
 def laterality_settings(directory, comparison_file, comparison, fold_hash, grading_digest, files):
     plan_file = directory / 'comparison-plan.json'
@@ -37,6 +47,25 @@ def laterality_settings(directory, comparison_file, comparison, fold_hash, gradi
         raise ValueError('The measured reflection improvement does not match these locked grading models')
     return {'fraction': .5, 'axis_cosine': tested['axis_cosine'],
             'code_sha256': checksum(Path(spine_laterality.__file__)),
+            'metrics_sha256': checksum(metrics_file)}
+
+
+def zoom_settings(directory, laterality, reflection, comparison, fold_hash, grading_digest, files):
+    plan_file = directory / 'comparison-plan.json'
+    metrics_file = directory / 'metrics.json'
+    tested = read_json(plan_file)
+    metrics = read_json(metrics_file)
+    prior = read_json(laterality / 'metrics.json')['reflected_blend']['macro_auroc']
+    if (tested['reflection'] != reflection or tested['models'] != files
+            or tested['field_fraction'] != FIELD_FRACTION or tested['zoom_fraction'] != ZOOM_BLEND
+            or tested['folds_sha256'] != fold_hash or tested['cache_sha256'] != grading_digest
+            or tested['source_predictions_sha256'] != checksum(laterality / 'equal-blend-oof.csv')
+            or tested['reference_sha256'] != comparison['baseline_sha256']
+            or metrics['plan_sha256'] != checksum(plan_file)
+            or not np.isclose(metrics['baseline']['macro_auroc'], prior, rtol=0, atol=1e-10)
+            or not metrics['zoom_blend']['macro_auroc'] > prior):
+        raise ValueError('The measured narrow-crop improvement does not match the locked grading models')
+    return {'field_fraction': FIELD_FRACTION, 'zoom_fraction': ZOOM_BLEND,
             'metrics_sha256': checksum(metrics_file)}
 
 
@@ -98,6 +127,9 @@ def lock(args):
     if args.laterality_report:
         sampling['laterality'] = laterality_settings(args.laterality_report, args.comparison, comparison, fold_hash,
                                                    grading_digest, fold_files)
+    if args.zoom_report:
+        sampling['lateral_zoom'] = zoom_settings(args.zoom_report, args.laterality_report, sampling['laterality'],
+                                                comparison, fold_hash, grading_digest, fold_files)
     write_json(args.output, {'reference_fraction': .5, 'folds_sha256': fold_hash,
                              'comparison_sha256': checksum(args.comparison),
                              'reference_selection_sha256': checksum(args.reference_selection),
@@ -147,6 +179,9 @@ def infer(args):
     if reflection and (reflection['fraction'] != .5 or reflection['axis_cosine'] != spine_laterality.AXIS_COSINE
                        or reflection['code_sha256'] != checksum(Path(spine_laterality.__file__))):
         raise ValueError('MRI reflection code differs from the fixed inference recipe')
+    zoom = plan.get('lateral_zoom')
+    if zoom and (not reflection or zoom['field_fraction'] != FIELD_FRACTION or zoom['zoom_fraction'] != ZOOM_BLEND):
+        raise ValueError('MRI zoom differs from the fixed inference recipe')
     prepare(args.root, args.cache, 'test', 4)
     cache = SpineCache.load(args.cache)
     grading_cache = native_inference_cache(args.root, cache, args.native_cache, plan) if args.native_cache else cache
@@ -156,6 +191,7 @@ def infer(args):
     inputs, geometry = anchor_inputs(cache, rows)
     folds = []
     reflection_trace = []
+    zoom_trace = []
     first_regions = None
     for entry in plan['models']:
         fold = entry['fold']
@@ -191,11 +227,24 @@ def infer(args):
                 reflection_trace.append({'fold': fold, 'eligible': eligible.tolist(),
                                          'original': probs.tolist(), 'reflected_aligned': aligned.tolist()})
             probs[eligible] = .5 * (probs[eligible] + reflected)
+        if zoom:
+            narrow = smaller_field(regions)
+            dataset = RegionDataset(grading_cache, rows, narrow, metadata, labels, resolution=resolution)
+            adjusted, _ = predict(model, DataLoader(dataset, batch_size=args.batch, pin_memory=True))
+            narrow_eligible, narrow_reflected = spine_laterality.predict_reflections(
+                model, grading_cache, rows, narrow, metadata, labels, resolution, args.batch)
+            adjusted[narrow_eligible] = .5 * (adjusted[narrow_eligible] + narrow_reflected)
+            if args.trace:
+                zoom_trace.append({'fold': fold, 'eligible': narrow_eligible.tolist(),
+                                   'regular': probs[:, LATERAL].tolist(), 'narrow': adjusted[:, LATERAL].tolist()})
+            probs[:, LATERAL] = (1 - ZOOM_BLEND) * probs[:, LATERAL] + ZOOM_BLEND * adjusted[:, LATERAL]
         folds.append(probs)
         if args.trace and first_regions is None:
             first_regions = {'fold': fold, 'coordinates': regions[:, :25].tolist(), 'quality': metadata[:, :25].tolist()}
             if args.native_cache:
                 first_regions.update(crop_resolution=resolution, cache_size=plan['native_size'])
+            if zoom:
+                first_regions['lateral_zoom_coordinates'] = narrow[:, LATERAL].tolist()
         del model
     model_probabilities = np.mean(folds, axis=0, dtype=np.float64)
     fraction = plan['reference_fraction']
@@ -212,6 +261,8 @@ def infer(args):
               'studies': len(rows), 'selected': 'equal blend of reference and spatial-detail MRI graders'}
     if reflection:
         report['selected'] += ' with left-right reflection'
+    if zoom:
+        report['selected'] += ' and narrower lateral crops'
     write_json(args.output.with_suffix('.json'), report)
     if args.trace:
         write_json(args.trace, {'task': 'spine', 'selection_sha256': digest, 'studies': cache.studies.tolist(),
@@ -219,7 +270,8 @@ def infer(args):
                                 'reference_probabilities': reference.tolist(), 'new_model_probabilities': model_probabilities.tolist(),
                                 'folds': list(range(5)), 'fold_probabilities': np.asarray(folds).tolist(),
                                 'blended_probabilities': blended.tolist(), 'first_fold_regions': first_regions,
-                                **({'reflection': reflection_trace} if reflection else {})})
+                                **({'reflection': reflection_trace} if reflection else {}),
+                                **({'lateral_zoom': {**zoom, 'folds': zoom_trace}} if zoom else {})})
     print(f"Verified {len(result)} prediction rows from the locked MRI ensemble.", flush=True)
 
 
@@ -234,6 +286,7 @@ def main():
     build.add_argument('--native-train-cache', type=Path)
     build.add_argument('--native-regions', type=Path)
     build.add_argument('--laterality-report', type=Path)
+    build.add_argument('--zoom-report', type=Path)
     for name in (*shared, 'plan', 'root', 'cache', 'prior'):
         run.add_argument(f'--{name}', type=Path, required=True)
     run.add_argument('--batch', type=int, default=8)
@@ -243,6 +296,8 @@ def main():
     if args.phase == 'lock':
         if bool(args.native_train_cache) != bool(args.native_regions):
             parser.error('Provide the native training cache and native regions together')
+        if args.zoom_report and not args.laterality_report:
+            parser.error('A zoom report requires the corresponding laterality report')
         lock(args)
     else:
         if args.batch < 1:

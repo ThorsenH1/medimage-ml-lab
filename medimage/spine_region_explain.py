@@ -102,7 +102,50 @@ def render_case(cache, case_index, regions, probabilities, output, annotated=Fal
     write_figure(fig, output)
 
 
-def render(cache_path: Path, trace_path: Path, output: Path) -> None:
+def render_lateral_zoom(cache, trace: dict, output: Path) -> None:
+    target = trace['targets'].index('left_subarticular_stenosis_l4_l5')
+    sampling = trace['first_fold_regions']
+    wide = np.asarray(sampling['coordinates'][0][target], dtype=np.float32)
+    narrow = np.asarray(sampling['lateral_zoom_coordinates'][0][target - 5], dtype=np.float32)
+    packed = np.full((30, 3, 5), -1, dtype=np.float32)
+    packed[:2] = wide, narrow
+    pixels = cache.volumes[0]
+    crops = crop_regions(pixels, packed, size=sampling.get('crop_resolution', ROI_SIZE))
+    slot = int(wide[1, 0])
+    if slot < 0 or slot != int(narrow[1, 0]):
+        raise ValueError('The two views must share a valid axial slice')
+
+    fig, axes = plt.subplots(1, 4, figsize=(12.5, 3.8), layout='constrained',
+                             gridspec_kw={'width_ratios': [1.2, .8, .8, 1.45]})
+    fig.suptitle('Zooming in on the left side at L4–L5', x=.025, ha='left', fontsize=16, fontweight='bold')
+    axes[0].imshow(pixels[slot], cmap='gray', vmin=0, vmax=255)
+    axes[0].set_title('Synthetic axial slice')
+    for row, color in zip((wide, narrow), ('#f6bf65', '#3df3d2'), strict=True):
+        _, x, y, width, height = row[1]
+        axes[0].add_patch(Rectangle((x - width / 2, y - height / 2), width, height,
+                                    fill=False, edgecolor=color, linewidth=1.5))
+    for axis, crop, title, color in zip(axes[1:3], crops[:2], ('Original crop', '80% field'),
+                                        ('#f6bf65', '#3df3d2'), strict=True):
+        axis.imshow(crop[1], cmap='gray', vmin=0, vmax=255)
+        axis.set_title(title, color='#37474f')
+        for side in axis.spines.values():
+            side.set_color(color)
+            side.set_linewidth(2.)
+    for axis in axes[:3]:
+        axis.set(xticks=[], yticks=[])
+
+    probabilities = np.asarray(trace['blended_probabilities'])[0, target]
+    axes[3].barh([0, 1, 2], probabilities, color=[BLUE, '#cfad4a', TEAL], height=.55)
+    axes[3].set(yticks=[0, 1, 2], yticklabels=['Normal / mild', 'Moderate', 'Severe'], xlim=(0, 1.04))
+    axes[3].set_title('Final ensemble')
+    axes[3].spines[['top', 'left', 'right']].set_visible(False)
+    axes[3].invert_yaxis()
+    for row, value in enumerate(probabilities):
+        axes[3].text(value + .025, row, f'{value:.2f}', va='center', fontsize=9)
+    write_figure(fig, output)
+
+
+def render(cache_path: Path, trace_path: Path, output: Path, zoom_output: Path | None = None) -> None:
     trace = read_json(trace_path)
     cache = SpineCache.load(cache_path)
     if trace['studies'] != [PHANTOM_STUDY] or cache.studies.tolist() != [PHANTOM_STUDY]:
@@ -113,14 +156,17 @@ def render(cache_path: Path, trace_path: Path, output: Path) -> None:
     regions = np.asarray(sampling['coordinates'][0], dtype=np.float32)
     render_case(cache, 0, regions, trace['blended_probabilities'][0], output,
                 crop_resolution=sampling.get('crop_resolution', ROI_SIZE))
+    if zoom_output is not None:
+        render_lateral_zoom(cache, trace, zoom_output)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('cache', 'trace', 'output'):
         parser.add_argument(f'--{name}', type=Path, required=True)
+    parser.add_argument('--zoom-output', type=Path)
     args = parser.parse_args()
-    render(args.cache, args.trace, args.output)
+    render(args.cache, args.trace, args.output, args.zoom_output)
 
 
 if __name__ == '__main__':
