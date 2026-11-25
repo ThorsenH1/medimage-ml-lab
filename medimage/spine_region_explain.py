@@ -12,10 +12,11 @@ from medimage.demo import PHANTOM_STUDY
 from medimage.portfolio_figures import BLUE, TEAL, plt, write_figure
 from medimage.spine_data import LEVELS, anchor_slot, project
 from medimage.spine_localize import SpineCache
-from medimage.spine_model import crop_regions
+from medimage.spine_model import ROI_SIZE, crop_regions
 
 
-def render_case(cache, case_index, regions, probabilities, output, annotated=False, reference_grades=None) -> None:
+def render_case(cache, case_index, regions, probabilities, output, annotated=False, reference_grades=None,
+                crop_resolution=ROI_SIZE) -> None:
     if regions.shape != (25, 3, 5):
         raise ValueError('Expected one three-slice window per graded disc-level target')
     grade_names = ('Normal / mild', 'Moderate', 'Severe')
@@ -26,7 +27,7 @@ def render_case(cache, case_index, regions, probabilities, output, annotated=Fal
         reference_grades = reference_grades.astype(np.int64, copy=False)
     packed = np.full((30, 3, 5), -1, dtype=np.float32)
     packed[:25] = regions
-    crops = crop_regions(cache.volumes[case_index], packed)
+    crops = crop_regions(cache.volumes[case_index], packed, size=crop_resolution)
     slots = regions[:5, 1, 0].astype(int)
     if (slots < 0).any():
         raise ValueError('The example is missing a sagittal disc region')
@@ -106,8 +107,12 @@ def render(cache_path: Path, trace_path: Path, output: Path) -> None:
     cache = SpineCache.load(cache_path)
     if trace['studies'] != [PHANTOM_STUDY] or cache.studies.tolist() != [PHANTOM_STUDY]:
         raise ValueError('The public figure expects the one generated MRI study')
-    regions = np.asarray(trace['first_fold_regions']['coordinates'][0], dtype=np.float32)
-    render_case(cache, 0, regions, trace['blended_probabilities'][0], output)
+    sampling = trace['first_fold_regions']
+    if sampling.get('cache_size', cache.volumes.shape[-1]) != cache.volumes.shape[-1]:
+        raise ValueError('The trace coordinates refer to a different image grid')
+    regions = np.asarray(sampling['coordinates'][0], dtype=np.float32)
+    render_case(cache, 0, regions, trace['blended_probabilities'][0], output,
+                crop_resolution=sampling.get('crop_resolution', ROI_SIZE))
 
 
 def main() -> None:
