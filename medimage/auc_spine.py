@@ -26,37 +26,56 @@ def auc_cells(labels: np.ndarray, probabilities: np.ndarray) -> tuple[np.ndarray
     return np.asarray(auc), np.asarray(ap), np.asarray(counts)
 
 
-def interval(labels, proba, groups, repeats):
+def ranking_statistics(labels, probabilities):
     statistics = []
     for index in range(labels.shape[1]):
         observed = np.flatnonzero(labels[:, index] >= 0)
         for grade in range(3):
-            p = proba[observed, index, grade]
+            p = probabilities[observed, index, grade]
             order = np.argsort(-p, kind='stable')
             sorted_rows = observed[order]
             p = p[order]
             end = np.r_[np.flatnonzero(p[1:] != p[:-1]), len(p) - 1]
             statistics.append((sorted_rows, labels[sorted_rows, index] == grade, end))
+    return statistics
+
+
+def bootstrap_macro(statistics, weight):
+    estimates = []
+    for rows, y, end in statistics:
+        total = weight[rows]
+        tp = np.cumsum(total * y)[end]
+        fp = np.cumsum(total)[end] - tp
+        if not tp[-1] or not fp[-1]:
+            return None
+        estimates.append(np.trapezoid(np.r_[0, tp / tp[-1]], np.r_[0, fp / fp[-1]]))
+    return float(np.mean(estimates))
+
+
+def interval(labels, proba, groups, repeats, reference=None):
+    statistics = ranking_statistics(labels, proba)
+    if reference is not None and reference.shape != proba.shape:
+        raise ValueError('Bootstrap reference must cover the same studies and targets')
+    reference_statistics = ranking_statistics(labels, reference) if reference is not None else None
     rng = np.random.default_rng(55318)
     folds = [np.flatnonzero(groups == group) for group in np.unique(groups)]
-    samples = []
+    samples, paired = [], []
     for _ in range(repeats):
         sample = np.concatenate([rng.choice(fold, len(fold), replace=True) for fold in folds])
         weight = np.bincount(sample, minlength=len(proba))
-        estimates = []
-        for rows, y, end in statistics:
-            total = weight[rows]
-            tp = np.cumsum(total * y)[end]
-            fp = np.cumsum(total)[end] - tp
-            if not tp[-1] or not fp[-1]:
-                break
-            estimates.append(np.trapezoid(np.r_[0, tp / tp[-1]], np.r_[0, fp / fp[-1]]))
-        if len(estimates) == len(statistics):
-            samples.append(np.mean(estimates))
+        estimate = bootstrap_macro(statistics, weight)
+        if estimate is None:
+            continue
+        samples.append(estimate)
+        if reference_statistics is not None:
+            paired.append(estimate - bootstrap_macro(reference_statistics, weight))
     if len(samples) < repeats * .8:
         raise ValueError('Too many bootstrap replicates lost a severity class')
-    return {'study_bootstrap_ci95': np.percentile(samples, [2.5, 97.5]).tolist(),
-            'bootstrap_repeats': repeats, 'valid_bootstrap_replicates': len(samples)}
+    result = {'study_bootstrap_ci95': np.percentile(samples, [2.5, 97.5]).tolist(),
+              'bootstrap_repeats': repeats, 'valid_bootstrap_replicates': len(samples)}
+    if paired:
+        result['paired_auroc_delta_ci95'] = np.percentile(paired, [2.5, 97.5]).tolist()
+    return result
 
 
 def figure(auc: np.ndarray, output: Path):

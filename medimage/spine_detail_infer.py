@@ -10,6 +10,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
+from medimage import spine_laterality, spine_native
 from medimage.common import checksum, read_json, write_json
 from medimage.spine_data import SEVERITIES, TARGETS, prepare
 from medimage.spine_heatmap import DiscHeatmap, anchor_inputs, observed_landmarks
@@ -17,8 +18,26 @@ from medimage.spine_heatmap_crossfit import anatomy_offsets, predict_heatmaps
 from medimage.spine_localize import SpineCache, inference_regions, make_regions, read_folds
 from medimage.spine_metrics import read_submission, submission
 from medimage.spine_model import ROI_SIZE, SpineClassifier
-from medimage import spine_native
 from medimage.spine_train import RegionDataset, predict
+
+
+def laterality_settings(directory, comparison_file, comparison, fold_hash, grading_digest, files):
+    plan_file = directory / 'comparison-plan.json'
+    metrics_file = directory / 'metrics.json'
+    tested = read_json(plan_file)
+    metrics = read_json(metrics_file)
+    original = comparison['equal_blend']['macro_auroc']
+    augmented = metrics['reflected_blend']['macro_auroc']
+    if (tested['comparison_sha256'] != checksum(comparison_file) or tested['folds_sha256'] != fold_hash
+            or tested['cache_sha256'] != grading_digest or tested['folds'] != files
+            or tested['axis_cosine'] != spine_laterality.AXIS_COSINE
+            or tested['reflection_weight'] != .5 or tested['detail_blend_weight'] != .5
+            or metrics['plan_sha256'] != checksum(plan_file)
+            or metrics['original_blend']['macro_auroc'] != original or not augmented > original):
+        raise ValueError('The measured reflection improvement does not match these locked grading models')
+    return {'fraction': .5, 'axis_cosine': tested['axis_cosine'],
+            'code_sha256': checksum(Path(spine_laterality.__file__)),
+            'metrics_sha256': checksum(metrics_file)}
 
 
 def lock(args):
@@ -48,6 +67,7 @@ def lock(args):
     _, geometry = anchor_inputs(cache, np.arange(len(folds)))
     xy = observed_landmarks(cache, geometry)
     entries = []
+    fold_files = {}
     for fold in range(5):
         key = str(fold)
         folder = args.runs / f'fold-{fold}'
@@ -73,6 +93,11 @@ def lock(args):
         if sampling:
             entry['crop_resolution'] = crop_resolution
         entries.append(entry)
+        fold_files[key] = {'region_sha256': region_digest, 'checkpoint_sha256': grade['checkpoint_sha256'],
+                           'oof_sha256': grade['prediction_sha256'], 'resolution': crop_resolution}
+    if args.laterality_report:
+        sampling['laterality'] = laterality_settings(args.laterality_report, args.comparison, comparison, fold_hash,
+                                                   grading_digest, fold_files)
     write_json(args.output, {'reference_fraction': .5, 'folds_sha256': fold_hash,
                              'comparison_sha256': checksum(args.comparison),
                              'reference_selection_sha256': checksum(args.reference_selection),
@@ -118,6 +143,10 @@ def infer(args):
         raise ValueError('Expected all five locked MRI models in fold order')
     if bool(args.native_cache) != ('native_size' in plan):
         raise ValueError('Provide a separate --native-cache for a native-resolution plan')
+    reflection = plan.get('laterality')
+    if reflection and (reflection['fraction'] != .5 or reflection['axis_cosine'] != spine_laterality.AXIS_COSINE
+                       or reflection['code_sha256'] != checksum(Path(spine_laterality.__file__))):
+        raise ValueError('MRI reflection code differs from the fixed inference recipe')
     prepare(args.root, args.cache, 'test', 4)
     cache = SpineCache.load(args.cache)
     grading_cache = native_inference_cache(args.root, cache, args.native_cache, plan) if args.native_cache else cache
@@ -126,6 +155,7 @@ def infer(args):
     labels = np.full((len(rows), 25), -1, dtype=np.int64)
     inputs, geometry = anchor_inputs(cache, rows)
     folds = []
+    reflection_trace = []
     first_regions = None
     for entry in plan['models']:
         fold = entry['fold']
@@ -152,6 +182,15 @@ def infer(args):
         model.load_state_dict(state['model'])
         dataset = RegionDataset(grading_cache, rows, regions, metadata, labels, resolution=resolution)
         probs, _ = predict(model, DataLoader(dataset, batch_size=args.batch, pin_memory=True))
+        if reflection:
+            eligible, reflected = spine_laterality.predict_reflections(
+                model, grading_cache, rows, regions, metadata, labels, resolution, args.batch)
+            if args.trace:
+                aligned = probs.copy()
+                aligned[eligible] = reflected
+                reflection_trace.append({'fold': fold, 'eligible': eligible.tolist(),
+                                         'original': probs.tolist(), 'reflected_aligned': aligned.tolist()})
+            probs[eligible] = .5 * (probs[eligible] + reflected)
         folds.append(probs)
         if args.trace and first_regions is None:
             first_regions = {'fold': fold, 'coordinates': regions[:, :25].tolist(), 'quality': metadata[:, :25].tolist()}
@@ -171,13 +210,16 @@ def infer(args):
     digest = checksum(args.plan)
     report = {'selection_sha256': digest, 'prediction_sha256': checksum(args.output), 'rows': len(result),
               'studies': len(rows), 'selected': 'equal blend of reference and spatial-detail MRI graders'}
+    if reflection:
+        report['selected'] += ' with left-right reflection'
     write_json(args.output.with_suffix('.json'), report)
     if args.trace:
         write_json(args.trace, {'task': 'spine', 'selection_sha256': digest, 'studies': cache.studies.tolist(),
                                 'targets': list(TARGETS), 'reference_fraction': fraction, 'new_model_fraction': 1 - fraction,
                                 'reference_probabilities': reference.tolist(), 'new_model_probabilities': model_probabilities.tolist(),
                                 'folds': list(range(5)), 'fold_probabilities': np.asarray(folds).tolist(),
-                                'blended_probabilities': blended.tolist(), 'first_fold_regions': first_regions})
+                                'blended_probabilities': blended.tolist(), 'first_fold_regions': first_regions,
+                                **({'reflection': reflection_trace} if reflection else {})})
     print(f"Verified {len(result)} prediction rows from the locked MRI ensemble.", flush=True)
 
 
@@ -191,6 +233,7 @@ def main():
         build.add_argument(f'--{name}', type=Path, required=True)
     build.add_argument('--native-train-cache', type=Path)
     build.add_argument('--native-regions', type=Path)
+    build.add_argument('--laterality-report', type=Path)
     for name in (*shared, 'plan', 'root', 'cache', 'prior'):
         run.add_argument(f'--{name}', type=Path, required=True)
     run.add_argument('--batch', type=int, default=8)
