@@ -75,16 +75,19 @@ def lock(args):
     original = base['selected']
     arrangements = list(GroupKFold(n_splits=5).split(truth, groups=groups))
     predictions = {value: np.empty_like(truth, dtype=np.float64) for value in STRENGTHS}
+    raw = np.stack(list(scores.values()), axis=-1)
+    calibrated = args.score_space == 'calibrated'
     for fit, check in arrangements:
-        calibrated, _ = calibrated_stack(scores, truth, fit)
+        values = calibrated_stack(scores, truth, fit)[0] if calibrated else raw
         for strength in STRENGTHS:
-            fractions = fit_findings(truth[fit], calibrated[fit], anchors, strength)
-            predictions[strength][check] = np.sum(calibrated[check] * fractions.T, axis=-1)
-    calibrated, parameters = calibrated_stack(scores, truth, np.arange(len(truth)))
+            fractions = fit_findings(truth[fit], values[fit], anchors, strength)
+            predictions[strength][check] = np.sum(values[check] * fractions.T, axis=-1)
+    values, parameters = calibrated_stack(scores, truth, np.arange(len(truth))) if calibrated else (raw, {})
+    method = 'calibrated-finding-rank-logit' if calibrated else 'raw-finding-rank-logit'
     candidates = []
     for strength in STRENGTHS:
-        final = fit_findings(truth, calibrated, anchors, strength)
-        candidates.append({'method': 'calibrated-finding-rank-logit', 'weight_strength': strength,
+        final = fit_findings(truth, values, anchors, strength)
+        candidates.append({'method': method, 'weight_strength': strength,
                            'weights': original['weights'],
                            'label_weights': {name: item.tolist() for name, item in zip(names, final, strict=True)},
                            'metrics': validation_metrics(truth, predictions[strength])})
@@ -118,6 +121,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('base-lock', 'work', 'previous', 'cohort', 'output'):
         parser.add_argument(f'--{name}', type=Path, required=True)
+    parser.add_argument('--score-space', choices=('calibrated', 'raw'), default='calibrated',
+                        help='Fit ranking weights on calibrated or original component logits')
     parser.set_defaults(task='chest')
     args = parser.parse_args()
     with threadpool_limits(limits=2):
