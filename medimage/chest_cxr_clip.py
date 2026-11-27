@@ -61,10 +61,11 @@ def load_image_tower(path: Path) -> dict:
 
 
 class ChestCxrClip(nn.Module):
-    def __init__(self, depth: int, dropout: float, weights: Path | None = None) -> None:
+    def __init__(self, depth: int, dropout: float, weights: Path | None = None, *, resolution: int = 224) -> None:
         super().__init__()
         self.weight_sha256 = CXR_CLIP_HASH
-        self.encoder = timm.create_model('swin_tiny_patch4_window7_224', pretrained=False, num_classes=0)
+        self.encoder = timm.create_model('swin_tiny_patch4_window7_224', pretrained=False, num_classes=0,
+                                         img_size=resolution)
         if weights is not None:
             self.encoder.load_state_dict(load_image_tower(weights), strict=True)
         self.encoder.requires_grad_(False)

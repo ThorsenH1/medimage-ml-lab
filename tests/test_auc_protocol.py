@@ -16,8 +16,11 @@ from medimage.auc_selection import (
 )
 from medimage.auc_train import ResidentPixels
 from medimage.mammo_rank_balance import ranking_pairs
+from medimage.mammo_subtype_tuning import rank_loss
 from medimage.radiography_evaluate import patient_bootstrap
+from medimage.spine_checkpoint_blend import interpolate
 from medimage.spine_native import reproject_regions
+from medimage.spine_pool_audit import factored_pool
 from medimage.visual_explain import patch_grid, soften
 
 
@@ -51,6 +54,16 @@ def test_lesion_balanced_ranking_retains_global_pairs_and_equalizes_added_mass()
     np.testing.assert_allclose((balanced - .5 * uniform).reshape(4, 3)[3, 2], .25)
     np.testing.assert_allclose(fit_pairwise_differences(pairs, .12, pair_weights=uniform),
                                fit_pairwise_weights(truth[:, None], logits, .12), atol=1e-10)
+
+
+def test_mammography_subtype_ranking_has_no_gradient_outside_its_cases():
+    truth = torch.tensor([True, False, True, False])
+    mask = torch.tensor([True, True, False, False])
+    scores = torch.tensor([-.2, .7, -.9, 2.], requires_grad=True)
+    rank_loss(scores, truth, mask).backward()
+    assert scores.grad[0] < 0 and scores.grad[1] > 0
+    torch.testing.assert_close(scores.grad[2:], torch.zeros(2))
+    assert rank_loss(scores, truth, truth).item() == 0
 
 
 def test_group_bagging_produces_normalized_model_weights():
@@ -114,6 +127,26 @@ def test_spine_grid_lift_preserves_physical_crop():
     lifted = reproject_regions(region, source, dest)
     np.testing.assert_allclose(lifted[0, 0, 0], [0., 9., 17., 16., 36.])
     np.testing.assert_array_equal(lifted[0, 0, 1], region[0, 0, 1])
+
+
+def test_spine_factored_pool_recovers_identical_predictions_and_reverses_weights():
+    original = np.broadcast_to([.7, .25, .05], (2, 25, 3))
+    native = np.broadcast_to([.3, .3, .4], (2, 25, 3))
+    np.testing.assert_allclose(factored_pool(original, original, 'equal_factored'), original)
+    blended = factored_pool(original, native, 'original_presence')
+    np.testing.assert_allclose(blended, factored_pool(native, original, 'native_presence'))
+    np.testing.assert_allclose(blended.sum(axis=-1), 1.)
+    boundary = factored_pool(np.broadcast_to([1., 0., 0.], (1, 25, 3)),
+                             np.broadcast_to([0., 0., 1.], (1, 25, 3)), 'equal_factored')
+    assert np.isfinite(boundary).all() and (boundary >= 0).all()
+
+
+def test_spine_checkpoint_interpolation_keeps_nonfloating_buffers():
+    parent = {'weights': torch.tensor([1., 3.]), 'buffer': torch.tensor([8], dtype=torch.long)}
+    tuned = {'weights': torch.tensor([3., 7.]), 'buffer': torch.tensor([12], dtype=torch.long)}
+    result = interpolate(parent, tuned, .25)
+    torch.testing.assert_close(result['weights'], torch.tensor([1.5, 4.]))
+    torch.testing.assert_close(result['buffer'], parent['buffer'])
 
 
 def test_texture_bank_marks_the_missing_view_and_responds_to_bright_spots():

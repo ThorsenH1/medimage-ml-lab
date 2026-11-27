@@ -15,6 +15,8 @@ from medimage.spine_geometry_probe import classification_summary
 from medimage.spine_localize import read_folds
 from medimage.spine_metrics import check_probabilities, read_submission, read_targets, submission
 
+BOUNDARY_FRACTIONS = {'equal_factored': (.5, .5), 'original_presence': (.75, .25), 'native_presence': (.25, .75)}
+
 
 def probability_pools(first: np.ndarray, second: np.ndarray) -> dict[str, np.ndarray]:
     check_probabilities(first)
@@ -33,7 +35,24 @@ def probability_pools(first: np.ndarray, second: np.ndarray) -> dict[str, np.nda
     return {'arithmetic': both.mean(axis=0), 'ordinal_log_odds': ordinal, 'geometric': geometric}
 
 
-def run(args: argparse.Namespace) -> None:
+def factored_pool(first: np.ndarray, second: np.ndarray, method: str) -> np.ndarray:
+    check_probabilities(first)
+    check_probabilities(second)
+    if first.shape != second.shape:
+        raise ValueError('The two graders must cover the same studies')
+    presence_weight, severity_weight = BOUNDARY_FRACTIONS[method]
+    grades = np.stack((first, second))
+    presence = grades[..., 1:].sum(axis=-1)
+    severe_if_present = np.divide(grades[..., 2], presence, out=np.full_like(presence, .5), where=presence > 0)
+    limits = (1e-7, 1 - 1e-7)
+    odds_present = logit(presence.clip(*limits))
+    odds_severe = logit(severe_if_present.clip(*limits))
+    combined = expit(presence_weight * odds_present[0] + (1 - presence_weight) * odds_present[1])
+    severe = expit(severity_weight * odds_severe[0] + (1 - severity_weight) * odds_severe[1])
+    return np.stack((1 - combined, combined * (1 - severe), combined * severe), axis=-1)
+
+
+def load_pool_inputs(args):
     studies = np.sort(pd.read_csv(args.root / 'train.csv', usecols=['study_id']).study_id.to_numpy(np.int64))
     folds = read_folds(args.folds, studies)
     fold_sha = checksum(args.folds)
@@ -55,21 +74,25 @@ def run(args: argparse.Namespace) -> None:
     native = np.clip(2 * baseline - previous, 0, 1)
     np.testing.assert_allclose(.5 * previous + .5 * native, baseline, atol=1e-10, rtol=0)
     check_probabilities(native)
-    results = {'studies': len(studies), 'fold_sha256': fold_sha, 'original_predictions_sha256': checksum(args.original),
-               'native_reflection_metrics_sha256': checksum(metrics_path),
-               'native_reflection_plan_sha256': checksum(plan_path), 'baseline_predictions_sha256': checksum(baseline_path),
-               'selection': 'exploratory comparison of fixed formulas on established outer folds', 'pools': {}}
+    published = classification_summary(truth, baseline)
+    for metric in ('macro_auroc', 'macro_average_precision', 'rsna_log_loss'):
+        if not np.isclose(published[metric], recorded['reflected_blend'][metric], atol=1e-10, rtol=0):
+            raise ValueError(f'Arithmetic control does not reproduce the published {metric}')
+    provenance = {'studies': len(studies), 'fold_sha256': fold_sha, 'original_predictions_sha256': checksum(args.original),
+                  'native_reflection_metrics_sha256': checksum(metrics_path),
+                  'native_reflection_plan_sha256': checksum(plan_path), 'baseline_predictions_sha256': checksum(baseline_path)}
+    return studies, folds, truth, previous, native, baseline, provenance
+
+
+def run(args: argparse.Namespace) -> None:
+    studies, folds, truth, previous, native, baseline, provenance = load_pool_inputs(args)
+    results = {**provenance, 'selection': 'exploratory comparison of fixed formulas on established outer folds', 'pools': {}}
     args.output.mkdir(parents=True, exist_ok=True)
     pools = probability_pools(previous, native)
     pools['arithmetic'] = baseline
     for name, predictions in pools.items():
         summary = classification_summary(truth, predictions)
-        if name == 'arithmetic':
-            published = recorded['reflected_blend']
-            for metric in ('macro_auroc', 'macro_average_precision', 'rsna_log_loss'):
-                if not np.isclose(summary[metric], published[metric], atol=1e-10, rtol=0):
-                    raise ValueError(f'Arithmetic control does not reproduce the published {metric}')
-        else:
+        if name != 'arithmetic':
             summary['paired_macro_auroc_delta'] = summary['macro_auroc'] - results['pools']['arithmetic']['macro_auroc']
             summary.update(interval(truth, predictions, folds, args.bootstrap, reference=baseline))
             submission(studies, predictions).to_csv(args.output / f'{name}-oof.csv', index=False)
@@ -92,7 +115,8 @@ def apply_pool(args: argparse.Namespace) -> None:
                                   for key in ('reference_probabilities', 'new_model_probabilities', 'blended_probabilities'))
     pools = probability_pools(previous, native)
     np.testing.assert_allclose(pools['arithmetic'], baseline, atol=1e-8, rtol=0)
-    result = submission(np.asarray(trace['studies'], dtype=np.int64), pools[args.method])
+    pooled = factored_pool(previous, native, args.method) if args.method in BOUNDARY_FRACTIONS else pools[args.method]
+    result = submission(np.asarray(trace['studies'], dtype=np.int64), pooled)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(args.output, index=False)
     write_json(args.output.with_suffix('.json'), {'pool': args.method, 'rows': len(result),
@@ -112,7 +136,7 @@ def main() -> None:
     score = modes.add_parser('apply')
     for name in ('report', 'plan', 'trace', 'output'):
         score.add_argument(f'--{name}', required=True, type=Path)
-    score.add_argument('--method', choices=('ordinal_log_odds', 'geometric'), default='geometric')
+    score.add_argument('--method', choices=('ordinal_log_odds', 'geometric', *BOUNDARY_FRACTIONS), default='geometric')
     args = parser.parse_args()
     if args.mode == 'apply':
         if args.output.suffix.lower() != '.csv':

@@ -52,7 +52,8 @@ def new_model(config: dict, weights: Path, *, initialize: bool = False):
         if config['backbone'] == 'cxr-clip-swin':
             from medimage.chest_cxr_clip import ChestCxrClip
 
-            return ChestCxrClip(config['depth'], config['dropout'], weights if initialize else None)
+            return ChestCxrClip(config['depth'], config['dropout'], weights if initialize else None,
+                                resolution=config.get('resolution', 224))
         return ChestDense(config['backbone'], config['depth'], weights if initialize else None)
     return MammographySpatial(config['backbone'], config['resolution'], weights,
                               config['depth'], config['dropout'], config.get('pyramid', False),
@@ -340,8 +341,8 @@ def main() -> None:
         parser.error('BioViL-T can fine-tune one or two residual stages')
     if args.backbone == 'convnext-chest' and args.depth not in (1, 2, 3):
         parser.error('ConvNeXt can fine-tune up to three residual stages')
-    if args.backbone == 'cxr-clip-swin' and (args.resolution != 224 or args.depth not in (1, 2, 3)):
-        parser.error('Use 224-pixel CXR-CLIP inputs and fine-tune one to three Swin stages')
+    if args.backbone == 'cxr-clip-swin' and (args.resolution not in (224, 384) or args.depth not in (1, 2, 3)):
+        parser.error('Use 224- or 384-pixel CXR-CLIP inputs and fine-tune one to three Swin stages')
     if args.backbone == 'chest-reference' and args.parent is None:
         parser.error('Provide a trained chest reference checkpoint with --parent')
     if args.domain_parent and (args.task != 'mammo' or args.parent is None):
