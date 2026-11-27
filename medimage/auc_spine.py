@@ -26,6 +26,13 @@ def auc_cells(labels: np.ndarray, probabilities: np.ndarray) -> tuple[np.ndarray
     return np.asarray(auc), np.asarray(ap), np.asarray(counts)
 
 
+def classification_summary(truth: np.ndarray, probability: np.ndarray) -> dict:
+    auc, ap, _ = auc_cells(truth, probability)
+    return {'macro_auroc': float(np.nanmean(auc)), 'macro_average_precision': float(np.nanmean(ap)),
+            'auroc_by_grade': np.nanmean(auc, axis=0).tolist(), 'evaluable_cells': int(np.isfinite(auc).sum()),
+            'rsna_log_loss': score(truth, probability)['score']}
+
+
 def ranking_statistics(labels, probabilities):
     statistics = []
     for index in range(labels.shape[1]):

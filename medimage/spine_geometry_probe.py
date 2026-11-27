@@ -9,22 +9,15 @@ import torch
 from scipy.spatial.distance import cdist
 from torch.utils.data import DataLoader
 
-from medimage.auc_spine import auc_cells
+from medimage.auc_spine import classification_summary
 from medimage.common import checksum, write_json
 from medimage.spine_data import project
 from medimage.spine_heatmap import DiscHeatmap, anchor_inputs, decode, mm_metrics, pixel_grid
 from medimage.spine_localize import (SpineCache, fit_localizer, image_features, make_regions, predict_keypoints,
                                      read_folds)
-from medimage.spine_metrics import read_targets, score
+from medimage.spine_metrics import read_targets
 from medimage.spine_model import SpineClassifier
 from medimage.spine_train import RegionDataset, _load_fold, predict
-
-
-def classification_summary(truth: np.ndarray, probability: np.ndarray) -> dict:
-    auc, ap, _ = auc_cells(truth, probability)
-    return {'macro_auroc': float(np.nanmean(auc)), 'macro_average_precision': float(np.nanmean(ap)),
-            'auroc_by_grade': np.nanmean(auc, axis=0).tolist(), 'evaluable_cells': int(np.isfinite(auc).sum()),
-            'rsna_log_loss': score(truth, probability)['score']}
 
 
 @torch.inference_mode()
