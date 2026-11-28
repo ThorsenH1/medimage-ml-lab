@@ -37,9 +37,8 @@ def bars(axis, labels, values, limits, label: str, threshold=None) -> None:
         axis.scatter(threshold, y, marker='|', s=240, linewidth=2, color=BLUE, zorder=3,
                      label='Validation threshold')
         axis.legend(loc='upper right', fontsize=8, frameon=False)
-    for pos, val in zip(y, values, strict=True):
-        marker_is_close = threshold is not None and val <= threshold[pos] <= val + .11 * limits[1]
-        axis.text(val + .014, pos + .30 * marker_is_close, f'{val:.3f}', va='center', fontsize=9)
+    annotations = [axis.text(val + .014, pos, f'{val:.3f}', va='center', fontsize=9)
+                   for pos, val in zip(y, values, strict=True)]
     axis.set_yticks(y, labels)
     axis.set_xlim(*limits)
     axis.set_xlabel(label, fontsize=9)
@@ -49,6 +48,14 @@ def bars(axis, labels, values, limits, label: str, threshold=None) -> None:
     axis.set_axisbelow(True)
     axis.tick_params(axis='y', length=0)
     axis.invert_yaxis()
+    if threshold is not None:
+        axis.figure.canvas.draw()
+        renderer = axis.figure.canvas.get_renderer()
+        for pos, cutoff, annotation in zip(y, threshold, annotations, strict=True):
+            marker_x, _ = axis.transData.transform((cutoff, pos))
+            box = annotation.get_window_extent(renderer)
+            if box.xmin - 3 <= marker_x <= box.xmax + 3:
+                annotation.set_y(pos + .30)
 
 
 def check_trace(trace):
